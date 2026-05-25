@@ -1,0 +1,17 @@
+[Unit]
+Description=Whisper Ctrl+Space dictation daemon
+After=pipewire.service pipewire-pulse.service sound.target
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%LOCAL_BIN%
+Restart=on-failure
+RestartSec=5
+
+# Needed for global hotkeys and desktop notifications on X11/GNOME
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=%t
+
+[Install]
+WantedBy=default.target
