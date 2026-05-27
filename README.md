@@ -871,11 +871,29 @@ Some of the examples are even ported to run in the browser using WebAssembly. Ch
 | [whisper.swiftui](examples/whisper.swiftui)         |                                       | SwiftUI iOS / macOS application using whisper.cpp                                                                               |
 | [whisper.android](examples/whisper.android)         |                                       | Android mobile application using whisper.cpp                                                                                    |
 | [whisper.nvim](examples/whisper.nvim)               |                                       | Speech-to-text plugin for Neovim                                                                                                |
-| [dictation](scripts/dictation)                      |                                       | **Ctrl+Space** desktop dictation (Pi / Linux); `bash scripts/dictation/install.sh`                                              |
+| [dictation](scripts/dictation)                      |                                       | **Ctrl+Space** desktop dictation (Pi / Linux) — see [setup on a new machine](#desktop-dictation-setup-new-machine) below       |
 | [generate-karaoke.sh](examples/generate-karaoke.sh) |                                       | Helper script to easily [generate a karaoke video](https://youtu.be/uj7hVta4blM) of raw audio capture                           |
 | [livestream.sh](examples/livestream.sh)             |                                       | [Livestream audio transcription](https://github.com/ggml-org/whisper.cpp/issues/185)                                            |
 | [yt-wsp.sh](examples/yt-wsp.sh)                     |                                       | Download + transcribe and/or translate any VOD [(original)](https://gist.github.com/DaniruKun/96f763ec1a037cc92fe1a059b643b818) |
 | [wchess](examples/wchess)                           | [wchess.wasm](examples/wchess)        | Voice-controlled chess                                                                                                          |
+
+### Desktop dictation setup (new machine)
+
+Local speech-to-text into any text field: **Ctrl+Space** to start, **Ctrl+Space** again to stop and paste. Runs on Debian/Ubuntu and Raspberry Pi (X11).
+
+**Prerequisites:** `git`, `sudo`, microphone, internet for the model download.
+
+```bash
+git clone https://github.com/XavierDedenbach/whisper.cpp.git
+cd whisper.cpp
+bash scripts/dictation/install.sh
+bash scripts/dictation/test-mic.sh    # speak during the 3s recording
+bash scripts/dictation/check.sh
+```
+
+Install builds `whisper-cli`, downloads the English model, and enables autostart at login. Edit `~/.config/whisper-dictation/config.env` to change hotkeys or the mic (`pactl list sources short`).
+
+More detail: [scripts/dictation/README.md](scripts/dictation/README.md).
 
 ## [Discussions](https://github.com/ggml-org/whisper.cpp/discussions)
 
