@@ -23,7 +23,7 @@ cd whisper.cpp
 bash scripts/dictation/install.sh
 ```
 
-This installs system packages, builds `whisper-cli`, downloads `base.en-q5_1`, and enables the dictation service at login.
+This installs system packages, builds `whisper-cli` / `whisper-server`, downloads `small.en`, and enables the dictation service at login. The warm server unit is enabled only when `WHISPER_BACKEND=server` in config.
 
 ### 3. Verify
 
@@ -38,11 +38,32 @@ Focus any text field → **Ctrl+Space** → speak → **Ctrl+Space** → text is
 
 ---
 
+## Accuracy (recommended)
+
+**Option 1 — better model + flags (default):** `WHISPER_MODEL=small.en` with `WHISPER_BACKEND=cli`, prompt, and non-speech suppression.
+
+**Option 2 — best quality + warm model:** download turbo and use the server backend:
+
+```bash
+./models/download-ggml-model.sh large-v3-turbo-q8_0
+# In ~/.config/whisper-dictation/config.env:
+#   WHISPER_MODEL=large-v3-turbo-q8_0
+#   WHISPER_BACKEND=server
+systemctl --user restart whisper-dictation-server whisper-dictation
+```
+
+If the server is down, the daemon falls back to `whisper-cli` automatically.
+
+---
+
 ## Install options
 
 ```bash
 # Smaller / faster model (Pi):
 WHISPER_MODEL=tiny.en-q5_1 bash scripts/dictation/install.sh
+
+# Best quality model:
+WHISPER_MODEL=large-v3-turbo-q8_0 bash scripts/dictation/install.sh
 
 # No autostart:
 bash scripts/dictation/install.sh --no-autostart
@@ -59,10 +80,10 @@ bash scripts/dictation/uninstall.sh
 ## Service commands
 
 ```bash
-systemctl --user status whisper-dictation
-systemctl --user restart whisper-dictation
-systemctl --user stop whisper-dictation
-systemctl --user disable whisper-dictation
+systemctl --user status whisper-dictation whisper-dictation-server
+systemctl --user restart whisper-dictation whisper-dictation-server
+systemctl --user stop whisper-dictation whisper-dictation-server
+systemctl --user disable whisper-dictation whisper-dictation-server
 ```
 
 ---
@@ -73,11 +94,16 @@ File: `~/.config/whisper-dictation/config.env` (created on first install)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WHISPER_MODEL` | `base.en-q5_1` | Model name |
+| `WHISPER_MODEL` | `small.en` | Model name (no `ggml-` prefix) |
+| `WHISPER_BACKEND` | `cli` | `cli` or `server` (warm `whisper-server`) |
+| `WHISPER_SERVER_URL` | `http://127.0.0.1:8178` | Server URL when backend=server |
+| `WHISPER_LANGUAGE` | `en` | Language id |
+| `WHISPER_SUPPRESS_NST` | `1` | Suppress non-speech tokens |
+| `WHISPER_PROMPT` | (see config.env) | Initial prompt / vocabulary hints |
 | `WHISPER_THREADS` | `4` | CPU threads |
 | `HOTKEY_MODIFIERS` | `ctrl` | `alt`, `shift`, `ctrl`, `super` |
 | `HOTKEY_KEY` | `space` | Trigger key |
-| `AUDIO_SOURCE` | auto-detected | PulseAudio source — list with `pactl list sources short` |
+| `AUDIO_SOURCE` | empty (system default) | PulseAudio source — list with `pactl list sources short` |
 | `INSERT_METHOD` | `clipboard` | `clipboard` or `type` |
 
 Example — set a specific USB mic:
@@ -97,6 +123,9 @@ systemctl --user restart whisper-dictation
 | Problem | Command / fix |
 |---------|----------------|
 | No speech detected | `bash scripts/dictation/test-mic.sh` — set `AUDIO_SOURCE` in config |
+| Misheard words | Prefer `small.en` or `large-v3-turbo-q8_0`; set `WHISPER_PROMPT` with your jargon |
+| Text pasted twice | Two daemons running — `rm ~/.config/autostart/whisper-dictation.desktop` then `systemctl --user restart whisper-dictation` |
+| Server fallback | Check `systemctl --user status whisper-dictation-server` |
 | Service not running | `systemctl --user status whisper-dictation` |
 | Wrong repo path | `bash scripts/dictation/install.sh --autostart-only` |
 | Hotkey conflict | Change `HOTKEY_*` in config, restart service |
@@ -110,6 +139,9 @@ systemctl --user restart whisper-dictation
 | `install.sh` | Full setup |
 | `uninstall.sh` | Remove autostart |
 | `dictation.py` | Hotkey daemon |
+| `run-server.sh` | Warm `whisper-server` launcher |
+| `whisper-dictation.service` | systemd user unit for the daemon |
+| `whisper-dictation-server.service` | systemd user unit for the warm server |
 | `config.env` | Default settings template |
 | `check.sh` | Health check |
 | `test-mic.sh` | Mic + transcription test |

@@ -9,9 +9,10 @@ ExecStart=%LOCAL_BIN%
 Restart=on-failure
 RestartSec=5
 
-# Needed for global hotkeys and desktop notifications on X11/GNOME
-Environment=DISPLAY=:0
+# DISPLAY is substituted at install time from the current session ($DISPLAY).
+Environment=DISPLAY=%DISPLAY%
 Environment=XDG_RUNTIME_DIR=%t
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 
 [Install]
 WantedBy=default.target

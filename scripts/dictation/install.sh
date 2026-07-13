@@ -8,6 +8,7 @@
 #
 # Options:
 #   WHISPER_MODEL=tiny.en-q5_1 ./install.sh   # smaller/faster model
+#   WHISPER_MODEL=large-v3-turbo-q8_0 ./install.sh  # best quality (pair with server backend)
 #   ./install.sh --no-autostart               # skip boot service
 #   ./install.sh --autostart-only             # re-register autostart only
 #
@@ -19,7 +20,8 @@ CONFIG_SRC="${SCRIPT_DIR}/config.env"
 CONFIG_DST="${HOME}/.config/whisper-dictation/config.env"
 INSTALL_ENV="${HOME}/.config/whisper-dictation/install.env"
 LOCAL_BIN="${HOME}/.local/bin/whisper-dictation"
-MODEL="${WHISPER_MODEL:-base.en-q5_1}"
+SERVER_BIN="${HOME}/.local/bin/whisper-dictation-server"
+MODEL="${WHISPER_MODEL:-small.en}"
 AUTOSTART=1
 AUTOSTART_ONLY=0
 
@@ -67,6 +69,20 @@ fi
 exec "${PY}" "${APP}" "$@"
 LAUNCHER
     chmod +x "${LOCAL_BIN}"
+
+    cat > "${SERVER_BIN}" <<'SERVER'
+#!/usr/bin/env bash
+set -euo pipefail
+INSTALL_ENV="${HOME}/.config/whisper-dictation/install.env"
+if [[ ! -f "${INSTALL_ENV}" ]]; then
+    echo "whisper-dictation-server: run scripts/dictation/install.sh first" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "${INSTALL_ENV}"
+exec "${WHISPER_REPO_ROOT}/scripts/dictation/run-server.sh" "$@"
+SERVER
+    chmod +x "${SERVER_BIN}"
 }
 
 detect_audio_source() {
@@ -99,7 +115,7 @@ install_system_packages() {
     echo "==> System packages (sudo)"
     if ! command -v sudo >/dev/null; then
         echo "    No sudo — install manually: build-essential cmake libopenblas-dev"
-        echo "    pulseaudio-utils xdotool xclip python3-venv"
+        echo "    pulseaudio-utils xdotool xclip curl python3-venv"
         return
     fi
     sudo apt-get update -qq
@@ -107,7 +123,7 @@ install_system_packages() {
         build-essential cmake \
         libopenblas-dev \
         pulseaudio-utils \
-        xdotool xclip \
+        xdotool xclip curl \
         python3-venv \
         libnotify-bin
 }
@@ -153,33 +169,43 @@ install_autostart() {
     write_launcher
     write_install_env
 
-    # GNOME / desktop session autostart
-    mkdir -p "${HOME}/.config/autostart"
-    cat > "${HOME}/.config/autostart/whisper-dictation.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=Whisper Dictation
-Comment=Ctrl+Space speech-to-text
-Exec=${LOCAL_BIN}
-Terminal=false
-Hidden=false
-NoDisplay=false
-X-GNOME-Autostart-enabled=true
-X-GNOME-Autostart-Delay=3
-EOF
+    # Only systemd — do not also install a .desktop autostart. Running both
+    # starts two daemons and every Ctrl+Space paste is typed twice.
+    rm -f "${HOME}/.config/autostart/whisper-dictation.desktop"
 
-    # systemd user service (reliable on Pi / Ubuntu)
+    local display="${DISPLAY:-:0}"
+    local backend="cli"
+    if [[ -f "${CONFIG_DST}" ]]; then
+        # shellcheck disable=SC1090
+        set -a
+        # shellcheck disable=SC1090
+        source "${CONFIG_DST}" 2>/dev/null || true
+        set +a
+        backend="${WHISPER_BACKEND:-cli}"
+    fi
+
     mkdir -p "${HOME}/.config/systemd/user"
-    sed "s|%LOCAL_BIN%|${LOCAL_BIN}|g; s|%t|${XDG_RUNTIME_DIR:-/run/user/$(id -u)}|g" \
+    sed "s|%SERVER_BIN%|${SERVER_BIN}|g; s|%t|${XDG_RUNTIME_DIR:-/run/user/$(id -u)}|g" \
+        "${SCRIPT_DIR}/whisper-dictation-server.service" \
+        > "${HOME}/.config/systemd/user/whisper-dictation-server.service"
+    sed "s|%LOCAL_BIN%|${LOCAL_BIN}|g; s|%DISPLAY%|${display}|g; s|%t|${XDG_RUNTIME_DIR:-/run/user/$(id -u)}|g" \
         "${SCRIPT_DIR}/whisper-dictation.service" \
         > "${HOME}/.config/systemd/user/whisper-dictation.service"
 
     systemctl --user daemon-reload
     systemctl --user enable whisper-dictation.service
     systemctl --user restart whisper-dictation.service 2>/dev/null || true
+    echo "    systemd: whisper-dictation.service (enabled, DISPLAY=${display})"
 
-    echo "    systemd: whisper-dictation.service (enabled)"
-    echo "    desktop: ~/.config/autostart/whisper-dictation.desktop"
+    if [[ "${backend}" == "server" ]]; then
+        systemctl --user enable whisper-dictation-server.service
+        systemctl --user restart whisper-dictation-server.service 2>/dev/null || true
+        echo "    systemd: whisper-dictation-server.service (enabled; WHISPER_BACKEND=server)"
+    else
+        systemctl --user disable whisper-dictation-server.service 2>/dev/null || true
+        systemctl --user stop whisper-dictation-server.service 2>/dev/null || true
+        echo "    systemd: whisper-dictation-server.service (disabled; set WHISPER_BACKEND=server to enable)"
+    fi
 }
 
 if [[ "${AUTOSTART_ONLY}" -eq 1 ]]; then
@@ -217,12 +243,14 @@ echo "Hotkey: Ctrl+Space → record, Ctrl+Space → stop & paste"
 echo ""
 if [[ "${AUTOSTART}" -eq 1 ]]; then
     echo "Autostart is ON (starts after login)."
-    echo "  Status:  systemctl --user status whisper-dictation"
-    echo "  Stop:    systemctl --user stop whisper-dictation"
-    echo "  Disable: systemctl --user disable whisper-dictation"
-    echo "           rm ~/.config/autostart/whisper-dictation.desktop"
+    echo "  Status:  systemctl --user status whisper-dictation whisper-dictation-server"
+    echo "  Stop:    systemctl --user stop whisper-dictation whisper-dictation-server"
+    echo "  Disable: systemctl --user disable whisper-dictation whisper-dictation-server"
+    echo "           # if an old GNOME autostart remains:"
+    echo "           rm -f ~/.config/autostart/whisper-dictation.desktop"
 else
     echo "Start manually: whisper-dictation"
+    echo "Optional warm server: whisper-dictation-server"
 fi
 echo ""
 echo "Verify mic: bash ${SCRIPT_DIR}/test-mic.sh"

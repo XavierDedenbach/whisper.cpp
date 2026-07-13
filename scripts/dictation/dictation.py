@@ -7,6 +7,9 @@ Uses scripts/dictation/.venv if present (created by install.sh).
 
 from __future__ import annotations
 
+import atexit
+import fcntl
+import json
 import os
 import signal
 import subprocess
@@ -127,10 +130,50 @@ def resolve_whisper_home(cfg: dict[str, str]) -> Path:
     return home if home.is_dir() else default
 
 
+def acquire_singleton_lock() -> object:
+    """Exit if another dictation daemon already holds the lock (avoids double paste)."""
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+    lock_path = runtime / "whisper-dictation.lock"
+    lock_file = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(
+            "whisper-dictation: another instance is already running; exiting",
+            file=sys.stderr,
+        )
+        lock_file.close()
+        sys.exit(0)
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    atexit.register(lock_file.close)
+    return lock_file
+
+
+def _truthy(val: str) -> bool:
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_transcript_output(stdout: str) -> str:
+    lines = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line in ("[BLANK_AUDIO]", "[ Silence ]", "[SILENCE]"):
+            continue
+        if line.startswith("[") and line.endswith("]") and "-->" not in line:
+            continue
+        if "]" in line and "-->" in line:
+            line = line.split("]", 1)[-1].strip()
+        lines.append(line)
+    return " ".join(lines).strip()
+
+
 class Dictation:
     def __init__(self, cfg: dict[str, str]) -> None:
         self.home = resolve_whisper_home(cfg)
-        model_name = cfg.get("WHISPER_MODEL", "base.en-q5_1")
+        model_name = cfg.get("WHISPER_MODEL", "small.en")
         self.model = self.home / "models" / f"ggml-{model_name}.bin"
         self.cli = self.home / "build/bin/whisper-cli"
         self.threads = cfg.get("WHISPER_THREADS", "4")
@@ -140,6 +183,11 @@ class Dictation:
         self.trigger_key = resolve_trigger_key(cfg.get("HOTKEY_KEY", "space"))
         self.hotkey_mode = cfg.get("HOTKEY_MODE", "toggle").strip().lower()
         self.audio_source = cfg.get("AUDIO_SOURCE", "").strip()
+        self.backend = cfg.get("WHISPER_BACKEND", "cli").strip().lower()
+        self.server_url = cfg.get("WHISPER_SERVER_URL", "http://127.0.0.1:8178").rstrip("/")
+        self.prompt = cfg.get("WHISPER_PROMPT", "").strip()
+        self.language = cfg.get("WHISPER_LANGUAGE", "en").strip() or "en"
+        self.suppress_nst = _truthy(cfg.get("WHISPER_SUPPRESS_NST", "1"))
 
         self._pressed: set = set()
         self._recording = False
@@ -311,18 +359,36 @@ class Dictation:
         self._notify(f"Typed: {preview}")
 
     def _transcribe(self, wav_path: str) -> str:
+        if self.backend == "server":
+            text = self._transcribe_server(wav_path)
+            if text is not None:
+                return text
+            print(
+                "whisper-dictation: server unavailable; falling back to whisper-cli",
+                file=sys.stderr,
+            )
+        return self._transcribe_cli(wav_path)
+
+    def _transcribe_cli(self, wav_path: str) -> str:
+        cmd = [
+            str(self.cli),
+            "-m",
+            str(self.model),
+            "-f",
+            wav_path,
+            "-nt",
+            "-np",
+            "-t",
+            self.threads,
+            "-l",
+            self.language,
+        ]
+        if self.suppress_nst:
+            cmd.append("-sns")
+        if self.prompt:
+            cmd.extend(["--prompt", self.prompt])
         result = subprocess.run(
-            [
-                str(self.cli),
-                "-m",
-                str(self.model),
-                "-f",
-                wav_path,
-                "-nt",
-                "-np",
-                "-t",
-                self.threads,
-            ],
+            cmd,
             cwd=self.home,
             capture_output=True,
             text=True,
@@ -332,19 +398,52 @@ class Dictation:
             err = (result.stderr or result.stdout or "transcription failed").strip()
             self._notify(err[:120])
             return ""
-        lines = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if line in ("[BLANK_AUDIO]", "[ Silence ]", "[SILENCE]"):
-                continue
-            if line.startswith("[") and line.endswith("]") and "-->" not in line:
-                continue
-            if "]" in line and "-->" in line:
-                line = line.split("]", 1)[-1].strip()
-            lines.append(line)
-        return " ".join(lines).strip()
+        return parse_transcript_output(result.stdout)
+
+    def _transcribe_server(self, wav_path: str) -> str | None:
+        """POST WAV to whisper-server. Return None to signal connection/HTTP failure."""
+        if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
+            return None
+        cmd = [
+            "curl",
+            "-sS",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "300",
+            f"{self.server_url}/inference",
+            "-F",
+            f"file=@{wav_path}",
+            "-F",
+            "temperature=0.0",
+            "-F",
+            "response_format=json",
+            "-F",
+            f"language={self.language}",
+        ]
+        if self.prompt:
+            cmd.extend(["-F", f"prompt={self.prompt}"])
+        if self.suppress_nst:
+            cmd.extend(["-F", "suppress_nst=true"])
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=310)
+        except subprocess.TimeoutExpired:
+            return None
+        if result.returncode != 0:
+            return None
+        body = (result.stdout or "").strip()
+        if not body:
+            return None
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return parse_transcript_output(body)
+        if isinstance(payload, dict) and "error" in payload:
+            return None
+        text = ""
+        if isinstance(payload, dict):
+            text = str(payload.get("text", "")).strip()
+        return " ".join(text.split())
 
     def _insert(self, text: str) -> None:
         use_clipboard = self.insert_method == "clipboard" and subprocess.run(
@@ -379,13 +478,17 @@ class Dictation:
             usage = f"  Press {label} to start, press again to stop and paste"
         else:
             usage = f"  Hold {label} to record, release to paste"
+        backend_line = f"  Backend: {self.backend}"
+        if self.backend == "server":
+            backend_line += f" ({self.server_url})"
         print(
             f"whisper-dictation ready\n"
             f"{usage}\n"
-            f"  Home: {self.home}\n"
-            f"  Model: {self.model.name} ({'ok' if self.model.is_file() else 'MISSING'})\n"
-            f"  CLI:   {self.cli.name} ({'ok' if self.cli.is_file() else 'MISSING'})\n"
-            f"  Mic:   {self.audio_source or '(system default)'}",
+            f"  Home:    {self.home}\n"
+            f"  Model:   {self.model.name} ({'ok' if self.model.is_file() else 'MISSING'})\n"
+            f"{backend_line}\n"
+            f"  CLI:     {self.cli.name} ({'ok' if self.cli.is_file() else 'MISSING'})\n"
+            f"  Mic:     {self.audio_source or '(system default)'}",
             flush=True,
         )
         if not ok:
@@ -397,6 +500,7 @@ class Dictation:
 
 
 def main() -> None:
+    acquire_singleton_lock()
     Dictation(load_config()).run()
 
 

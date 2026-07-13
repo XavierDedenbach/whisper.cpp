@@ -1,0 +1,14 @@
+[Unit]
+Description=Whisper dictation warm model server (whisper-server)
+After=network.target
+Before=whisper-dictation.service
+
+[Service]
+Type=simple
+ExecStart=%SERVER_BIN%
+Restart=on-failure
+RestartSec=3
+Environment=XDG_RUNTIME_DIR=%t
+
+[Install]
+WantedBy=default.target
