@@ -1,0 +1,20 @@
+# Example vocabulary for whisper dictation.
+# Copy to ~/.config/whisper-dictation/vocabulary.txt and edit.
+# Aliases: db / database
+
+# projects
+Vantage
+dreambox
+dream-catcher
+
+# data & formats
+MCAP
+database
+db
+
+# engineering
+COTS
+ADR
+pull request
+PR
+babysit

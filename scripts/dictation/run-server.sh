@@ -20,9 +20,12 @@ MODEL="${WHISPER_MODEL:-small.en}"
 THREADS="4"
 LANGUAGE="en"
 SUPPRESS_NST="1"
+CARRY_INITIAL_PROMPT="1"
 PROMPT=""
 HOST="127.0.0.1"
 PORT="8178"
+PY="${ROOT}/scripts/dictation/.venv/bin/python"
+VOCAB_PY="${ROOT}/scripts/dictation/vocab_prompt.py"
 
 if [[ -f "${CONFIG}" ]]; then
     # shellcheck disable=SC1090
@@ -34,7 +37,12 @@ if [[ -f "${CONFIG}" ]]; then
     THREADS="${WHISPER_THREADS:-$THREADS}"
     LANGUAGE="${WHISPER_LANGUAGE:-$LANGUAGE}"
     SUPPRESS_NST="${WHISPER_SUPPRESS_NST:-$SUPPRESS_NST}"
-    PROMPT="${WHISPER_PROMPT:-}"
+    CARRY_INITIAL_PROMPT="${WHISPER_CARRY_INITIAL_PROMPT:-$CARRY_INITIAL_PROMPT}"
+    if [[ -x "${PY}" && -f "${VOCAB_PY}" ]]; then
+        PROMPT="$("${PY}" "${VOCAB_PY}")"
+    else
+        PROMPT="${WHISPER_PROMPT:-}"
+    fi
     if [[ -n "${WHISPER_SERVER_URL:-}" ]]; then
         url="${WHISPER_SERVER_URL#http://}"
         url="${url#https://}"
@@ -73,5 +81,8 @@ esac
 if [[ -n "${PROMPT}" ]]; then
     args+=(--prompt "${PROMPT}")
 fi
+case "${CARRY_INITIAL_PROMPT,,}" in
+    1|true|yes|on) args+=(--carry-initial-prompt) ;;
+esac
 
 exec "${BIN}" "${args[@]}"

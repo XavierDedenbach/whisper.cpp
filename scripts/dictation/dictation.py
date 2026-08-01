@@ -10,13 +10,16 @@ from __future__ import annotations
 import atexit
 import fcntl
 import json
+import math
 import os
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 
 _venv = Path(__file__).resolve().parent / ".venv" / "lib"
@@ -34,6 +37,8 @@ except ImportError:
     )
     sys.exit(1)
 
+from vocab_prompt import build_whisper_prompt
+
 MODIFIER_KEYS = {
     "alt": {keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr},
     "shift": {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r},
@@ -42,16 +47,29 @@ MODIFIER_KEYS = {
 }
 
 
-def build_recorder_cmd(audio_source: str) -> list[str] | None:
+def build_recorder_cmd(audio_source: str, cfg: dict[str, str] | None = None) -> list[str] | None:
     """Build argv to record 16 kHz mono WAV; prefer parecord (reliable WAV finalize)."""
+    cfg = cfg or {}
+    latency_msec = cfg.get("RECORDER_LATENCY_MSEC", "20").strip() or "20"
     source = audio_source.strip()
     if subprocess.run(["which", "parecord"], capture_output=True).returncode == 0:
-        cmd = ["parecord", "--rate=16000", "--channels=1", "--file-format=wav"]
+        cmd = [
+            "parecord",
+            f"--latency-msec={latency_msec}",
+            "--rate=16000",
+            "--channels=1",
+            "--file-format=wav",
+        ]
         if source:
             cmd.extend(["-d", source])
         return cmd
     if subprocess.run(["which", "pw-record"], capture_output=True).returncode == 0:
-        cmd = ["pw-record", "--rate=16000", "--channels=1"]
+        cmd = [
+            "pw-record",
+            f"--latency={latency_msec}ms",
+            "--rate=16000",
+            "--channels=1",
+        ]
         if source:
             cmd.extend(["--target", source])
         return cmd
@@ -61,6 +79,54 @@ def build_recorder_cmd(audio_source: str) -> list[str] | None:
             cmd.extend(["-D", source])
         return cmd
     return None
+
+
+def wait_for_wav_stable(path: str, timeout: float = 1.0) -> None:
+    """Wait until WAV file size stops growing (recorder flushed to disk)."""
+    if not path or not os.path.exists(path):
+        return
+    deadline = time.monotonic() + timeout
+    last_size = -1
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        size = os.path.getsize(path)
+        if size == last_size:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= 0.05:
+                return
+        else:
+            last_size = size
+            stable_since = None
+        time.sleep(0.02)
+
+
+def graceful_stop_recorder(
+    proc: subprocess.Popen | None,
+    wav_path: str | None,
+    flush_msec: float,
+) -> None:
+    """Keep recording briefly to capture buffered tail audio, then finalize WAV."""
+    if flush_msec > 0 and proc and proc.poll() is None:
+        time.sleep(flush_msec / 1000.0)
+    if not proc or proc.poll() is not None:
+        if wav_path:
+            wait_for_wav_stable(wav_path)
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+    except ProcessLookupError:
+        proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            proc.kill()
+        proc.wait(timeout=2)
+    if wav_path:
+        wait_for_wav_stable(wav_path)
 
 
 def wake_audio_source(source: str) -> None:
@@ -154,6 +220,49 @@ def _truthy(val: str) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+# Whisper often hallucinates these on silence / accidental short clips.
+_HALLUCINATION_PHRASES = (
+    "thank you",
+    "thanks for watching",
+    "thanks for listening",
+    "thank you for watching",
+    "please subscribe",
+    "see you next time",
+    "the end",
+    "bye",
+    "goodbye",
+    "subtitle",
+    "subtitles",
+)
+
+
+def wav_rms(path: str) -> float:
+    """Root-mean-square amplitude of 16-bit mono WAV (0 = digital silence)."""
+    with wave.open(path, "rb") as wf:
+        if wf.getsampwidth() != 2 or wf.getnchannels() < 1:
+            return 0.0
+        frames = wf.readframes(wf.getnframes())
+    if len(frames) < 2:
+        return 0.0
+    samples = struct.unpack("<" + "h" * (len(frames) // 2), frames)
+    if not samples:
+        return 0.0
+    mean_sq = sum(s * s for s in samples) / len(samples)
+    return math.sqrt(mean_sq)
+
+
+def is_likely_hallucination(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().rstrip(".!?").split())
+    if not normalized:
+        return True
+    if normalized in {"you", "the", "i", "it", "a", "and", "or"}:
+        return True
+    return any(
+        normalized == phrase or normalized.startswith(phrase + " ")
+        for phrase in _HALLUCINATION_PHRASES
+    )
+
+
 def parse_transcript_output(stdout: str) -> str:
     lines = []
     for line in stdout.splitlines():
@@ -178,6 +287,10 @@ class Dictation:
         self.cli = self.home / "build/bin/whisper-cli"
         self.threads = cfg.get("WHISPER_THREADS", "4")
         self.min_record = float(cfg.get("MIN_RECORD_SEC", "0.4"))
+        self.min_toggle_stop = float(cfg.get("MIN_TOGGLE_STOP_SEC", "0.75"))
+        self.min_audio_rms = float(cfg.get("MIN_AUDIO_RMS", "80"))
+        self.recorder_latency_msec = float(cfg.get("RECORDER_LATENCY_MSEC", "20"))
+        self.recorder_stop_flush_msec = float(cfg.get("RECORDER_STOP_FLUSH_MSEC", "120"))
         self.insert_method = cfg.get("INSERT_METHOD", "clipboard")
         self.mod_groups = parse_modifiers(cfg.get("HOTKEY_MODIFIERS", "ctrl"))
         self.trigger_key = resolve_trigger_key(cfg.get("HOTKEY_KEY", "space"))
@@ -185,7 +298,8 @@ class Dictation:
         self.audio_source = cfg.get("AUDIO_SOURCE", "").strip()
         self.backend = cfg.get("WHISPER_BACKEND", "cli").strip().lower()
         self.server_url = cfg.get("WHISPER_SERVER_URL", "http://127.0.0.1:8178").rstrip("/")
-        self.prompt = cfg.get("WHISPER_PROMPT", "").strip()
+        self.prompt = build_whisper_prompt(cfg)
+        self.carry_initial_prompt = _truthy(cfg.get("WHISPER_CARRY_INITIAL_PROMPT", "1"))
         self.language = cfg.get("WHISPER_LANGUAGE", "en").strip() or "en"
         self.suppress_nst = _truthy(cfg.get("WHISPER_SUPPRESS_NST", "1"))
 
@@ -196,8 +310,9 @@ class Dictation:
         self._record_start = 0.0
         self._lock = threading.Lock()
         self._busy = False
-        self._recorder = build_recorder_cmd(self.audio_source)
+        self._recorder = build_recorder_cmd(self.audio_source, cfg)
         self._hotkey_chord_active = False  # ignore Space key-repeat until release
+        self._hotkey_label_str = self._hotkey_label(cfg)
 
     def _mods_active(self) -> bool:
         if not self.mod_groups:
@@ -219,9 +334,17 @@ class Dictation:
             return
         # toggle: start or stop on each Ctrl+Space press
         if self._recording:
+            elapsed = time.monotonic() - self._record_start
+            if elapsed < self.min_toggle_stop:
+                self._notify(
+                    f"Still recording ({elapsed:.1f}s) — speak, then {self._hotkey_label_str} to stop"
+                )
+                return
             threading.Thread(target=self._finish_recording, daemon=True).start()
         elif not self._busy:
             threading.Thread(target=self._start_recording, daemon=True).start()
+        else:
+            self._notify("Transcribing previous recording…")
 
     def on_press(self, key) -> None:
         self._pressed.add(key)
@@ -301,19 +424,8 @@ class Dictation:
             duration = time.monotonic() - self._record_start
 
         if proc and proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
-            except ProcessLookupError:
-                proc.send_signal(signal.SIGINT)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    proc.kill()
-                proc.wait(timeout=2)
-        time.sleep(0.12)
+            self._notify("Saving recording…")
+        graceful_stop_recorder(proc, wav, self.recorder_stop_flush_msec)
 
         wav_bytes = os.path.getsize(wav) if wav and os.path.exists(wav) else 0
         if wav_bytes < 1000:
@@ -339,6 +451,17 @@ class Dictation:
             self._notify("Too short — speak longer, then Ctrl+Space to stop")
             return
 
+        rms = wav_rms(wav)
+        if rms < self.min_audio_rms:
+            if wav and os.path.exists(wav):
+                os.unlink(wav)
+            self._busy = False
+            self._notify(
+                f"No speech detected (mic level {rms:.0f}, need ≥{self.min_audio_rms:.0f}) — "
+                "check mic / wrong input device (run: bash scripts/dictation/test-mic.sh)"
+            )
+            return
+
         self._notify("Transcribing…")
         try:
             text = self._transcribe(wav)
@@ -351,6 +474,12 @@ class Dictation:
             self._notify(
                 "No speech in recording — check mic level / wrong input device "
                 "(run: bash scripts/dictation/test-mic.sh)"
+            )
+            return
+
+        if is_likely_hallucination(text) and rms < self.min_audio_rms * 2:
+            self._notify(
+                f"Ignored likely silence hallucination ({text!r}) — try again with the mic closer"
             )
             return
 
@@ -423,6 +552,8 @@ class Dictation:
         ]
         if self.prompt:
             cmd.extend(["-F", f"prompt={self.prompt}"])
+        if self.carry_initial_prompt:
+            cmd.extend(["-F", "carry_initial_prompt=true"])
         if self.suppress_nst:
             cmd.extend(["-F", "suppress_nst=true"])
         try:
