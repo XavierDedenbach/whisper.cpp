@@ -125,14 +125,16 @@ install_system_packages() {
         pulseaudio-utils \
         xdotool xclip curl \
         python3-venv \
-        libnotify-bin
+        libnotify-bin \
+        python3-gi \
+        gir1.2-ayatanaappindicator3-0.1
 }
 
 install_python() {
     echo "==> Python venv (pynput)"
     python3 -m venv "${SCRIPT_DIR}/.venv"
     "${SCRIPT_DIR}/.venv/bin/pip" install -q --upgrade pip
-    "${SCRIPT_DIR}/.venv/bin/pip" install -q pynput
+    "${SCRIPT_DIR}/.venv/bin/pip" install -q pynput pystray pillow
 }
 
 build_whisper() {

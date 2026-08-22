@@ -36,6 +36,8 @@ bash scripts/dictation/check.sh
 
 Focus any text field → **Ctrl+Space** → speak → **Ctrl+Space** → text is pasted.
 
+A **silver dot** in the desktop top-panel tray shows dictation is running; it **blinks bright red** while recording. Notifications are 1 s each and replace the previous one.
+
 ---
 
 ## Accuracy (recommended)
@@ -126,6 +128,7 @@ systemctl --user restart whisper-dictation
 | Misheard words | Prefer `small.en` or `large-v3-turbo-q8_0`; set `WHISPER_PROMPT` with your jargon |
 | Text pasted twice | Two daemons running — `rm ~/.config/autostart/whisper-dictation.desktop` then `systemctl --user restart whisper-dictation` |
 | Server fallback | Check `systemctl --user status whisper-dictation-server` |
+| Tray dot missing | Install AppIndicator support (`bash scripts/dictation/install.sh`), enable GNOME AppIndicator extension if tray icons are hidden, restart service |
 | Service not running | `systemctl --user status whisper-dictation` |
 | Wrong repo path | `bash scripts/dictation/install.sh --autostart-only` |
 | Hotkey conflict | Change `HOTKEY_*` in config, restart service |
@@ -139,6 +142,7 @@ systemctl --user restart whisper-dictation
 | `install.sh` | Full setup |
 | `uninstall.sh` | Remove autostart |
 | `dictation.py` | Hotkey daemon |
+| `dictation_indicator.py` | Top-panel tray LED (silver idle, red blink while recording) |
 | `run-server.sh` | Warm `whisper-server` launcher |
 | `whisper-dictation.service` | systemd user unit for the daemon |
 | `whisper-dictation-server.service` | systemd user unit for the warm server |

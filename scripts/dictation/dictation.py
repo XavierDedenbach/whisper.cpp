@@ -37,6 +37,7 @@ except ImportError:
     )
     sys.exit(1)
 
+from dictation_indicator import TrayIndicator, tray_indicator_available
 from vocab_prompt import build_whisper_prompt
 
 MODIFIER_KEYS = {
@@ -313,6 +314,10 @@ class Dictation:
         self._recorder = build_recorder_cmd(self.audio_source, cfg)
         self._hotkey_chord_active = False  # ignore Space key-repeat until release
         self._hotkey_label_str = self._hotkey_label(cfg)
+        self._notify_ms = int(cfg.get("NOTIFY_MS", cfg.get("NOTIFY_DEFAULT_MS", "1000")))
+        self._tray_enabled = _truthy(cfg.get("TRAY_INDICATOR", "1"))
+        blink_s = float(cfg.get("INDICATOR_BLINK_SEC", "1.0"))
+        self._tray = TrayIndicator(blink_interval_s=blink_s)
 
     def _mods_active(self) -> bool:
         if not self.mod_groups:
@@ -366,9 +371,22 @@ class Dictation:
             threading.Thread(target=self._finish_recording, daemon=True).start()
 
     def _notify(self, msg: str) -> None:
+        dwell_ms = self._notify_ms
         try:
             subprocess.run(
-                ["notify-send", "-a", "whisper-dictation", "-t", "2500", "Dictation", msg],
+                [
+                    "notify-send",
+                    "-a",
+                    "whisper-dictation",
+                    "-r",
+                    "whisper-dictation",
+                    "-t",
+                    str(dwell_ms),
+                    "-h",
+                    "int:transient:1",
+                    "Dictation",
+                    msg,
+                ],
                 check=False,
                 timeout=2,
             )
@@ -408,6 +426,7 @@ class Dictation:
                 return
             self._recording = True
             self._record_start = time.monotonic()
+            self._tray.set_recording(True)
             if self.hotkey_mode == "toggle":
                 self._notify("Recording… (Ctrl+Space to stop)")
             else:
@@ -419,12 +438,11 @@ class Dictation:
                 return
             self._recording = False
             self._busy = True
+            self._tray.set_recording(False)
             proc = self._record_proc
             wav = self._wav_path
             duration = time.monotonic() - self._record_start
 
-        if proc and proc.poll() is None:
-            self._notify("Saving recording…")
         graceful_stop_recorder(proc, wav, self.recorder_stop_flush_msec)
 
         wav_bytes = os.path.getsize(wav) if wav and os.path.exists(wav) else 0
@@ -462,7 +480,6 @@ class Dictation:
             )
             return
 
-        self._notify("Transcribing…")
         try:
             text = self._transcribe(wav)
         finally:
@@ -601,7 +618,25 @@ class Dictation:
         key = cfg.get("HOTKEY_KEY", "space")
         return f"{mods}+{key}"
 
+    def _start_tray_indicator(self) -> None:
+        if not self._tray_enabled:
+            return
+        if self._tray.start():
+            return
+        hint = "re-run: bash scripts/dictation/install.sh"
+        if not tray_indicator_available():
+            print(
+                f"whisper-dictation: tray indicator unavailable (missing pystray/Pillow); {hint}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"whisper-dictation: tray indicator failed to start; {hint}",
+                file=sys.stderr,
+            )
+
     def run(self) -> None:
+        self._start_tray_indicator()
         ok = self.cli.is_file() and self.model.is_file()
         cfg = load_config()
         label = self._hotkey_label(cfg)
