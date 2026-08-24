@@ -190,7 +190,9 @@ File: `~/.config/whisper-dictation/config.env` (created on first install)
 | `WHISPER_SERVER_URL` | `http://127.0.0.1:8178` | Server URL when backend=server |
 | `WHISPER_LANGUAGE` | `en` | Language id |
 | `WHISPER_SUPPRESS_NST` | `1` | Suppress non-speech tokens |
-| `WHISPER_PROMPT` | (see config.env) | Initial prompt / vocabulary hints |
+| `WHISPER_PROMPT_PREFIX` | `Technical dictation.` | Prefix for the vocabulary prompt |
+| `WHISPER_VOCABULARY_FILE` | `~/.config/whisper-dictation/vocabulary.txt` | Optional machine-local overlay (shared terms are in-repo) |
+| `WHISPER_PROMPT` | (see config.env) | Fallback prompt if no vocabulary file exists |
 | `WHISPER_THREADS` | `4` | CPU threads |
 | `HOTKEY_MODIFIERS` | `ctrl` | `alt`, `shift`, `ctrl`, `super` |
 | `HOTKEY_KEY` | `space` | Trigger key |
@@ -214,13 +216,33 @@ systemctl --user restart whisper-dictation
 | Problem | Command / fix |
 |---------|----------------|
 | No speech detected | `bash scripts/dictation/test-mic.sh` — set `AUDIO_SOURCE` in config |
-| Misheard words | Prefer `small.en` or `large-v3-turbo-q8_0`; set `WHISPER_PROMPT` with your jargon |
+| Misheard words | Add the term to `scripts/dictation/vocabulary.txt` (see Terminology below), then restart |
 | Text pasted twice | Two daemons running — `rm ~/.config/autostart/whisper-dictation.desktop` then `systemctl --user restart whisper-dictation` |
 | Server fallback | Check `systemctl --user status whisper-dictation-server` |
 | Tray dot missing | Install AppIndicator support (`bash scripts/dictation/install.sh`), enable GNOME AppIndicator extension if tray icons are hidden, restart service |
 | Service not running | `systemctl --user status whisper-dictation` |
 | Wrong repo path | `bash scripts/dictation/install.sh --autostart-only` |
 | Hotkey conflict | Change `HOTKEY_*` in config, restart service |
+
+---
+
+## Terminology (shared vocabulary)
+
+`scripts/dictation/vocabulary.txt` is the committed term list used on every machine after `git pull`. Whisper sees the canonical spellings as an initial prompt; `canonical => spoken / mishearing` lines also rewrite those forms after transcription.
+
+**Primary spoken form for `os_droid`:** say **OS underscore droid**. Saying “osdroid” as one word is heard as *oesteroid*, *oysteroid*, and similar.
+
+```text
+os_droid => OS underscore droid / oesteroid / oysteroid
+```
+
+Add a term, commit, pull on the other laptop, then restart:
+
+```bash
+systemctl --user restart whisper-dictation whisper-dictation-server
+```
+
+Optional machine-local extras (not in git): `~/.config/whisper-dictation/vocabulary.txt`.
 
 ---
 
@@ -236,5 +258,8 @@ systemctl --user restart whisper-dictation
 | `whisper-dictation.service` | systemd user unit for the daemon |
 | `whisper-dictation-server.service` | systemd user unit for the warm server |
 | `config.env` | Default settings template |
+| `vocabulary.txt` | Shared terminology (committed; used on all machines) |
+| `vocabulary.txt.example` | Template for optional local overlay terms |
+| `vocab_prompt.py` | Builds the Whisper prompt and applies replacements |
 | `check.sh` | Health check |
 | `test-mic.sh` | Mic + transcription test |

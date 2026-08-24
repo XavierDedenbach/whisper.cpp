@@ -38,7 +38,7 @@ except ImportError:
     sys.exit(1)
 
 from dictation_indicator import TrayIndicator, tray_indicator_available
-from vocab_prompt import build_whisper_prompt
+from vocab_prompt import apply_replacements, build_whisper_prompt, load_all_vocabulary
 
 MODIFIER_KEYS = {
     "alt": {keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr},
@@ -300,6 +300,7 @@ class Dictation:
         self.backend = cfg.get("WHISPER_BACKEND", "cli").strip().lower()
         self.server_url = cfg.get("WHISPER_SERVER_URL", "http://127.0.0.1:8178").rstrip("/")
         self.prompt = build_whisper_prompt(cfg)
+        _, self.replacements = load_all_vocabulary(cfg)
         self.carry_initial_prompt = _truthy(cfg.get("WHISPER_CARRY_INITIAL_PROMPT", "1"))
         self.language = cfg.get("WHISPER_LANGUAGE", "en").strip() or "en"
         self.suppress_nst = _truthy(cfg.get("WHISPER_SUPPRESS_NST", "1"))
@@ -481,7 +482,7 @@ class Dictation:
             return
 
         try:
-            text = self._transcribe(wav)
+            text = apply_replacements(self._transcribe(wav), self.replacements)
         finally:
             if os.path.exists(wav):
                 os.unlink(wav)

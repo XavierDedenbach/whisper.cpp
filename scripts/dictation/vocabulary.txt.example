@@ -1,20 +1,12 @@
-# Example vocabulary for whisper dictation.
-# Copy to ~/.config/whisper-dictation/vocabulary.txt and edit.
+# Example overlay for machine-local terms.
+# Shared terminology lives in scripts/dictation/vocabulary.txt (committed).
+# Copy this file to ~/.config/whisper-dictation/vocabulary.txt only for extras
+# that should not be in git.
+#
+# Format:
+#   term
+#   term / alias
+#   canonical => spoken form / mishearing
+#
 # Aliases: db / database
-
-# projects
-Vantage
-dreambox
-dream-catcher
-
-# data & formats
-MCAP
-database
-db
-
-# engineering
-COTS
-ADR
-pull request
-PR
-babysit
+# Replacements: os_droid => OS underscore droid / oesteroid

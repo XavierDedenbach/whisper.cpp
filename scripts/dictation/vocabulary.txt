@@ -1,0 +1,30 @@
+# Shared whisper-dictation terminology (committed — git pull on both machines).
+# Restart whisper-dictation and whisper-dictation-server after edits.
+#
+# Format:
+#   term
+#   term / alias                         all go into the Whisper prompt
+#   canonical => spoken / mishearing     canonical in prompt; right-hand
+#                                        forms are rewritten after transcription
+#
+# Do not list mishearings on the left of => (that would bias Whisper toward them).
+
+# projects
+Vantage
+dreambox
+dream-catcher
+
+# Speak as "OS underscore droid". Saying "osdroid" is heard as oesteroid / oysteroid.
+os_droid => OS underscore droid / oesteroid / oysteroid / osteroid / ostroid / osdroid / os-droid / os droid / oestroid / oisteroid / oyster droid
+
+# data & formats
+MCAP
+database
+db
+
+# engineering
+COTS
+ADR
+pull request
+PR
+babysit
