@@ -40,6 +40,95 @@ A **silver dot** in the desktop top-panel tray shows dictation is running; it **
 
 ---
 
+## Machine profiles: Spark workstation vs LG Gram laptop
+
+`install.sh` builds **CPU + OpenBLAS**. Hotkey, tray LED, and paste are the same on both machines. Use **X11** (not Wayland) for global Ctrl+Space and `xdotool` paste.
+
+### Tray LED — pin in Quick Settings (both machines)
+
+The recording indicator is identical on Spark and the Gram. Pin it to the **top bar / Quick Settings** area so you always see whether dictation is recording (not buried in hidden tray icons).
+
+| LED | Meaning |
+|-----|---------|
+| Silver dot | Dictation running, **not** recording |
+| Red blink | **Recording** |
+
+**Pin the icon (Ubuntu GNOME, X11):**
+
+1. After install, confirm the service is up: `systemctl --user status whisper-dictation`
+2. Open the system menu (top-right). If you see a silver dot only under **hidden icons** (chevron / overflow), open that list.
+3. Pin **Whisper dictation** to the visible top bar:
+   - Ubuntu 24.04+: **Settings → Ubuntu Desktop → Icons** — show tray icons and keep the dictation LED visible, or use the pin affordance in the tray overflow when offered.
+4. Ensure `TRAY_INDICATOR="1"` in `~/.config/whisper-dictation/config.env` (default).
+
+If no dot appears, install AppIndicator support (`bash scripts/dictation/install.sh`) and enable the **AppIndicator** / **KStatusNotifierItem** extension, then restart:
+
+```bash
+systemctl --user restart whisper-dictation
+```
+
+Once pinned, the LED is your always-on recording status — notifications are optional and can lag behind.
+
+### Spark workstation
+
+Typical setup: large turbo model, warm server, tuned thread count.
+
+1. Install:
+
+```bash
+bash scripts/dictation/install.sh
+```
+
+2. In `~/.config/whisper-dictation/config.env`:
+
+```bash
+WHISPER_MODEL="large-v3-turbo-q8_0"
+WHISPER_BACKEND="server"
+WHISPER_THREADS="8"
+```
+
+3. Download model and enable the warm server:
+
+```bash
+./models/download-ggml-model.sh large-v3-turbo-q8_0
+systemctl --user enable whisper-dictation-server
+systemctl --user restart whisper-dictation-server whisper-dictation
+```
+
+4. Pin the tray LED (see above) so recording status stays visible in Quick Settings.
+
+### LG Gram (Intel Evo i7, X11)
+
+Same install path; bump threads to match the laptop CPU.
+
+1. Install:
+
+```bash
+bash scripts/dictation/install.sh
+```
+
+2. In `~/.config/whisper-dictation/config.env`:
+
+```bash
+WHISPER_THREADS="8"    # match core count (8–12 on most Gram i7 configs)
+WHISPER_MODEL="large-v3-turbo-q8_0"   # optional; better accuracy
+WHISPER_BACKEND="server"              # optional; faster repeat dictation
+```
+
+3. If using the large model + server:
+
+```bash
+./models/download-ggml-model.sh large-v3-turbo-q8_0
+systemctl --user enable whisper-dictation-server
+systemctl --user restart whisper-dictation-server whisper-dictation
+```
+
+4. Pin the tray LED (see above) so recording status stays visible in Quick Settings.
+
+`small.en` with `WHISPER_BACKEND=cli` is fine for a lighter first install on the Gram.
+
+---
+
 ## Accuracy (recommended)
 
 **Option 1 — better model + flags (default):** `WHISPER_MODEL=small.en` with `WHISPER_BACKEND=cli`, prompt, and non-speech suppression.
