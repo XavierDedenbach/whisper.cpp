@@ -31,5 +31,5 @@ db
 COTS
 ADR
 pull request
-PR => P R
+pr => P R / PR
 babysit
