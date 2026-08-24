@@ -61,7 +61,7 @@ def parse_vocabulary(text: str) -> tuple[list[str], list[tuple[str, str]]]:
                 terms.append(canonical)
             for src in _split_aliases(right):
                 src_key = src.lower()
-                if src_key == key or src_key in seen_src:
+                if src == canonical or src_key in seen_src:
                     continue
                 seen_src.add(src_key)
                 replacements.append((src, canonical))

@@ -13,12 +13,17 @@
 Vantage
 dreambox
 dream-catcher
+dreamweaver => Dream Weaver / dream weaver / DreamWeaver
+dream-synth => dream synth / dreamsynth / Dream Synth
+dream sequence => dreamsequence / Dream Sequence
 
 # Speak as "OS underscore droid". Saying "osdroid" is heard as oesteroid / oysteroid.
 os_droid => OS underscore droid / oesteroid / oysteroid / osteroid / ostroid / osdroid / os-droid / os droid / oestroid / oisteroid / oyster droid
 
 # data & formats
 MCAP
+RLDS => R L D S / R.L.D.S.
+KarlP => Karl P / Carl P / CarlP / Karp
 database
 db
 
@@ -26,5 +31,5 @@ db
 COTS
 ADR
 pull request
-PR
+PR => P R
 babysit
