@@ -42,7 +42,15 @@ A **silver dot** in the desktop top-panel tray shows dictation is running; it **
 
 ## Machine profiles: Spark workstation vs LG Gram laptop
 
-`install.sh` builds **CPU + OpenBLAS**. Hotkey, tray LED, and paste are the same on both machines. Use **X11** (not Wayland) for global Ctrl+Space and `xdotool` paste.
+`install.sh` always builds the portable **CPU + OpenBLAS** path in `build/`. Optional CUDA and SYCL builds live beside it, so pulling this fork never replaces another machine's selected backend. Existing machine-local config is preserved by `install.sh`.
+
+| Backend | Build | Select with |
+|---------|-------|-------------|
+| CPU (portable default) | `bash scripts/dictation/install.sh` | `WHISPER_BUILD_DIR="build"` |
+| NVIDIA CUDA | `bash scripts/dictation/build-cuda.sh` | `WHISPER_BUILD_DIR="build-cuda"` |
+| Intel SYCL Level Zero | `bash scripts/dictation/build-sycl.sh` | `WHISPER_BUILD_DIR="build-sycl"` |
+
+Keep `WHISPER_ACCELERATOR="auto"`; it detects CUDA/SYCL from the build name or CMake cache. Hotkey, tray LED, and paste behavior are shared across backends. Use **X11** (not Wayland) for global Ctrl+Space and `xdotool` paste.
 
 ### Tray LED — pin in Quick Settings (both machines)
 
@@ -69,7 +77,7 @@ systemctl --user restart whisper-dictation
 
 Once pinned, the LED is your always-on recording status — notifications are optional and can lag behind.
 
-### Spark workstation
+### Spark workstation (NVIDIA CUDA)
 
 Typical setup: large turbo model, warm server, tuned thread count.
 
@@ -79,23 +87,33 @@ Typical setup: large turbo model, warm server, tuned thread count.
 bash scripts/dictation/install.sh
 ```
 
-2. In `~/.config/whisper-dictation/config.env`:
+2. With the NVIDIA driver and CUDA toolkit installed, create the side-by-side CUDA build:
+
+```bash
+bash scripts/dictation/build-cuda.sh
+```
+
+Set `WHISPER_CUDA_ARCHITECTURES` only when the CUDA toolkit cannot detect the installed GPU architecture automatically.
+
+3. In `~/.config/whisper-dictation/config.env`:
 
 ```bash
 WHISPER_MODEL="large-v3-turbo-q8_0"
 WHISPER_BACKEND="server"
 WHISPER_THREADS="8"
+WHISPER_BUILD_DIR="build-cuda"
+WHISPER_ACCELERATOR="auto"
 ```
 
-3. Download model and enable the warm server:
+4. Download the model and refresh the services:
 
 ```bash
 ./models/download-ggml-model.sh large-v3-turbo-q8_0
-systemctl --user enable whisper-dictation-server
+WHISPER_MODEL=large-v3-turbo-q8_0 bash scripts/dictation/install.sh --autostart-only
 systemctl --user restart whisper-dictation-server whisper-dictation
 ```
 
-4. Pin the tray LED (see above) so recording status stays visible in Quick Settings.
+5. Pin the tray LED (see above) so recording status stays visible in Quick Settings.
 
 ### LG Gram (Intel Evo i7, X11)
 
@@ -107,25 +125,44 @@ Same install path; bump threads to match the laptop CPU.
 bash scripts/dictation/install.sh
 ```
 
-2. In `~/.config/whisper-dictation/config.env`:
+2. With the Intel oneAPI C++/SYCL compiler and Level Zero runtime installed, create or refresh the side-by-side GPU build:
 
 ```bash
-WHISPER_THREADS="8"    # match core count (8–12 on most Gram i7 configs)
-WHISPER_MODEL="large-v3-turbo-q8_0"   # optional; better accuracy
-WHISPER_BACKEND="server"              # optional; faster repeat dictation
+bash scripts/dictation/build-sycl.sh
 ```
 
-3. If using the large model + server:
+The helper requires the configured Intel Level Zero GPU to appear in `sycl-ls`. The LG profile pins the expected device name to Iris Xe with `WHISPER_SYCL_EXPECTED_DEVICE`; leave that setting empty on other Intel GPUs. It configures the supported `whisper-cli` and `whisper-server` targets in `build-sycl/` while preserving the CPU build in `build/`.
+
+3. Select the persistent warm server in `~/.config/whisper-dictation/config.env`:
 
 ```bash
-./models/download-ggml-model.sh large-v3-turbo-q8_0
+WHISPER_THREADS="8"
+WHISPER_MODEL="small.en"
+WHISPER_BUILD_DIR="build-sycl"
+WHISPER_ACCELERATOR="auto"
+WHISPER_ONEAPI_SETVARS="/opt/intel/oneapi/setvars.sh"
+WHISPER_ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+WHISPER_SYCL_DEVICE="0"
+WHISPER_SYCL_EXPECTED_DEVICE="Intel Iris Xe Graphics"
+WHISPER_BACKEND="server"
+WHISPER_SERVER_WARMUP="1"
+```
+
+4. Refresh and restart the units. The server performs one disposable inference before systemd marks it ready:
+
+```bash
+WHISPER_MODEL=small.en bash scripts/dictation/install.sh --autostart-only
 systemctl --user enable whisper-dictation-server
 systemctl --user restart whisper-dictation-server whisper-dictation
 ```
 
-4. Pin the tray LED (see above) so recording status stays visible in Quick Settings.
+5. Pin the tray LED (see above) so recording status stays visible in Quick Settings.
 
-`small.en` with `WHISPER_BACKEND=cli` is fine for a lighter first install on the Gram.
+Rollback does not rebuild or uninstall anything. With `WHISPER_ACCELERATOR="auto"`, change only `WHISPER_BUILD_DIR="build"`, then restart both services:
+
+```bash
+systemctl --user restart whisper-dictation-server whisper-dictation
+```
 
 ---
 
@@ -186,8 +223,17 @@ File: `~/.config/whisper-dictation/config.env` (created on first install)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WHISPER_MODEL` | `small.en` | Model name (no `ggml-` prefix) |
+| `WHISPER_BUILD_DIR` | `build` | Build directory under the repo, such as `build`, `build-cuda`, or `build-sycl` |
+| `WHISPER_ACCELERATOR` | `auto` | Detect CUDA/SYCL from the build name or CMake cache; otherwise use CPU. Explicit `cuda` or `sycl` supports nonstandard build names |
+| `WHISPER_ONEAPI_SETVARS` | `/opt/intel/oneapi/setvars.sh` | oneAPI environment script used for SYCL |
+| `WHISPER_ONEAPI_DEVICE_SELECTOR` | `level_zero:gpu` | oneAPI device filter |
+| `WHISPER_SYCL_DEVICE` | `0` | `GGML_SYCL_DEVICE` index |
+| `WHISPER_SYCL_EXPECTED_DEVICE` | empty | Optional strict name substring for the selected Intel Level Zero GPU |
 | `WHISPER_BACKEND` | `cli` | `cli` or `server` (warm `whisper-server`) |
 | `WHISPER_SERVER_URL` | `http://127.0.0.1:8178` | Server URL when backend=server |
+| `WHISPER_SERVER_WARMUP` | `1` | Run one inference before the server reports ready |
+| `WHISPER_SERVER_WARMUP_AUDIO` | JFK sample | Optional warmup WAV override |
+| `WHISPER_SERVER_WARMUP_TIMEOUT` | `120` | Startup/warmup timeout in seconds |
 | `WHISPER_LANGUAGE` | `en` | Language id |
 | `WHISPER_SUPPRESS_NST` | `1` | Suppress non-speech tokens |
 | `WHISPER_PROMPT_PREFIX` | `Technical dictation.` | Prefix for the vocabulary prompt |
@@ -219,6 +265,9 @@ systemctl --user restart whisper-dictation
 | Misheard words | Add the term to `scripts/dictation/vocabulary.txt` (see Terminology below), then restart |
 | Text pasted twice | Two daemons running — `rm ~/.config/autostart/whisper-dictation.desktop` then `systemctl --user restart whisper-dictation` |
 | Server fallback | Check `systemctl --user status whisper-dictation-server` |
+| First GPU request is slow | Keep `WHISPER_SERVER_WARMUP=1`; wait for the server unit to become `active` before dictating |
+| CUDA backend missing | Run `nvidia-smi`, confirm `nvcc` is installed, rebuild with `build-cuda.sh`, then run `check.sh` |
+| SYCL device missing | Source oneAPI and run `ONEAPI_DEVICE_SELECTOR=level_zero:gpu sycl-ls` |
 | Tray dot missing | Install AppIndicator support (`bash scripts/dictation/install.sh`), enable GNOME AppIndicator extension if tray icons are hidden, restart service |
 | Service not running | `systemctl --user status whisper-dictation` |
 | Wrong repo path | `bash scripts/dictation/install.sh --autostart-only` |
@@ -255,6 +304,10 @@ Optional machine-local extras (not in git): `~/.config/whisper-dictation/vocabul
 | `dictation.py` | Hotkey daemon |
 | `dictation_indicator.py` | Top-panel tray LED (silver idle, red blink while recording) |
 | `run-server.sh` | Warm `whisper-server` launcher |
+| `build-cuda.sh` | Reproducible NVIDIA CUDA build helper |
+| `build-sycl.sh` | Reproducible Intel Level Zero SYCL build helper |
+| `runtime-env.sh` | Shared side-by-side build and accelerator environment resolver |
+| `validate-server-response.py` | Shared strict JSON response validator for startup and health checks |
 | `whisper-dictation.service` | systemd user unit for the daemon |
 | `whisper-dictation-server.service` | systemd user unit for the warm server |
 | `config.env` | Default settings template |

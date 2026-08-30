@@ -37,8 +37,12 @@ except ImportError:
     )
     sys.exit(1)
 
-from dictation_indicator import TrayIndicator, tray_indicator_available
-from vocab_prompt import apply_replacements, build_whisper_prompt, load_all_vocabulary
+from dictation_indicator import TrayIndicator, tray_indicator_available  # noqa: E402
+from vocab_prompt import (  # noqa: E402
+    apply_replacements,
+    build_whisper_prompt,
+    load_all_vocabulary,
+)
 
 MODIFIER_KEYS = {
     "alt": {keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr},
@@ -48,7 +52,9 @@ MODIFIER_KEYS = {
 }
 
 
-def build_recorder_cmd(audio_source: str, cfg: dict[str, str] | None = None) -> list[str] | None:
+def build_recorder_cmd(
+    audio_source: str, cfg: dict[str, str] | None = None
+) -> list[str] | None:
     """Build argv to record 16 kHz mono WAV; prefer parecord (reliable WAV finalize)."""
     cfg = cfg or {}
     latency_msec = cfg.get("RECORDER_LATENCY_MSEC", "20").strip() or "20"
@@ -197,6 +203,13 @@ def resolve_whisper_home(cfg: dict[str, str]) -> Path:
     return home if home.is_dir() else default
 
 
+def resolve_whisper_build_dir(cfg: dict[str, str], home: Path) -> Path:
+    """Resolve the configured side-by-side build directory."""
+    raw = cfg.get("WHISPER_BUILD_DIR", "build").strip() or "build"
+    build_dir = Path(os.path.expanduser(os.path.expandvars(raw)))
+    return build_dir if build_dir.is_absolute() else home / build_dir
+
+
 def acquire_singleton_lock() -> object:
     """Exit if another dictation daemon already holds the lock (avoids double paste)."""
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
@@ -283,25 +296,32 @@ def parse_transcript_output(stdout: str) -> str:
 class Dictation:
     def __init__(self, cfg: dict[str, str]) -> None:
         self.home = resolve_whisper_home(cfg)
+        self.build_dir = resolve_whisper_build_dir(cfg, self.home)
         model_name = cfg.get("WHISPER_MODEL", "small.en")
         self.model = self.home / "models" / f"ggml-{model_name}.bin"
-        self.cli = self.home / "build/bin/whisper-cli"
+        self.cli = self.build_dir / "bin/whisper-cli"
         self.threads = cfg.get("WHISPER_THREADS", "4")
         self.min_record = float(cfg.get("MIN_RECORD_SEC", "0.4"))
         self.min_toggle_stop = float(cfg.get("MIN_TOGGLE_STOP_SEC", "0.75"))
         self.min_audio_rms = float(cfg.get("MIN_AUDIO_RMS", "80"))
         self.recorder_latency_msec = float(cfg.get("RECORDER_LATENCY_MSEC", "20"))
-        self.recorder_stop_flush_msec = float(cfg.get("RECORDER_STOP_FLUSH_MSEC", "120"))
+        self.recorder_stop_flush_msec = float(
+            cfg.get("RECORDER_STOP_FLUSH_MSEC", "120")
+        )
         self.insert_method = cfg.get("INSERT_METHOD", "clipboard")
         self.mod_groups = parse_modifiers(cfg.get("HOTKEY_MODIFIERS", "ctrl"))
         self.trigger_key = resolve_trigger_key(cfg.get("HOTKEY_KEY", "space"))
         self.hotkey_mode = cfg.get("HOTKEY_MODE", "toggle").strip().lower()
         self.audio_source = cfg.get("AUDIO_SOURCE", "").strip()
         self.backend = cfg.get("WHISPER_BACKEND", "cli").strip().lower()
-        self.server_url = cfg.get("WHISPER_SERVER_URL", "http://127.0.0.1:8178").rstrip("/")
+        self.server_url = cfg.get("WHISPER_SERVER_URL", "http://127.0.0.1:8178").rstrip(
+            "/"
+        )
         self.prompt = build_whisper_prompt(cfg)
         _, self.replacements = load_all_vocabulary(cfg)
-        self.carry_initial_prompt = _truthy(cfg.get("WHISPER_CARRY_INITIAL_PROMPT", "1"))
+        self.carry_initial_prompt = _truthy(
+            cfg.get("WHISPER_CARRY_INITIAL_PROMPT", "1")
+        )
         self.language = cfg.get("WHISPER_LANGUAGE", "en").strip() or "en"
         self.suppress_nst = _truthy(cfg.get("WHISPER_SUPPRESS_NST", "1"))
 
@@ -315,7 +335,9 @@ class Dictation:
         self._recorder = build_recorder_cmd(self.audio_source, cfg)
         self._hotkey_chord_active = False  # ignore Space key-repeat until release
         self._hotkey_label_str = self._hotkey_label(cfg)
-        self._notify_ms = int(cfg.get("NOTIFY_MS", cfg.get("NOTIFY_DEFAULT_MS", "1000")))
+        self._notify_ms = int(
+            cfg.get("NOTIFY_MS", cfg.get("NOTIFY_DEFAULT_MS", "1000"))
+        )
         self._tray_enabled = _truthy(cfg.get("TRAY_INDICATOR", "1"))
         blink_s = float(cfg.get("INDICATOR_BLINK_SEC", "1.0"))
         self._tray = TrayIndicator(blink_interval_s=blink_s)
@@ -331,7 +353,9 @@ class Dictation:
         return key
 
     def _is_trigger(self, key) -> bool:
-        return key == self.trigger_key or self._key_id(key) == self._key_id(self.trigger_key)
+        return key == self.trigger_key or self._key_id(key) == self._key_id(
+            self.trigger_key
+        )
 
     def _on_hotkey(self) -> None:
         if self.hotkey_mode == "hold":
@@ -399,7 +423,9 @@ class Dictation:
             if self._recording or self._busy:
                 return
             if not self.cli.is_file():
-                self._notify(f"Missing {self.cli.name}; run scripts/dictation/install.sh")
+                self._notify(
+                    f"Missing {self.cli.name}; run scripts/dictation/install.sh"
+                )
                 return
             if not self.model.is_file():
                 self._notify(f"Missing model {self.model.name}")
@@ -595,9 +621,10 @@ class Dictation:
         return " ".join(text.split())
 
     def _insert(self, text: str) -> None:
-        use_clipboard = self.insert_method == "clipboard" and subprocess.run(
-            ["which", "xclip"], capture_output=True
-        ).returncode == 0
+        use_clipboard = (
+            self.insert_method == "clipboard"
+            and subprocess.run(["which", "xclip"], capture_output=True).returncode == 0
+        )
         if use_clipboard:
             subprocess.run(
                 ["xclip", "-selection", "clipboard"],
@@ -659,10 +686,14 @@ class Dictation:
             flush=True,
         )
         if not ok:
-            msg = "whisper-cli or model missing — run: bash scripts/dictation/install.sh"
+            msg = (
+                "whisper-cli or model missing — run: bash scripts/dictation/install.sh"
+            )
             print(msg, file=sys.stderr)
             self._notify(msg)
-        with keyboard.Listener(on_press=self.on_press, on_release=self.on_release) as listener:
+        with keyboard.Listener(
+            on_press=self.on_press, on_release=self.on_release
+        ) as listener:
             listener.join()
 
 

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Record 3 seconds from the configured mic and run whisper (sanity check).
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/runtime-env.sh"
+whisper_dictation_load_runtime
+ROOT="${WHISPER_REPO_ROOT}"
 CFG="${HOME}/.config/whisper-dictation/config.env"
-CLI="${ROOT}/build/bin/whisper-cli"
-MODEL="${ROOT}/models/ggml-base.en-q5_1.bin"
+CLI="${WHISPER_BIN_DIR}/whisper-cli"
+MODEL_NAME="${WHISPER_MODEL:-small.en}"
+MODEL="${ROOT}/models/ggml-${MODEL_NAME}.bin"
 WAV="/tmp/whisper-mic-test.wav"
 SOURCE=""
 
-if [[ -f "${CFG}" ]]; then
-    # shellcheck disable=SC1090
-    source <(grep -E '^AUDIO_SOURCE=' "${CFG}" | sed 's/^/export /') 2>/dev/null || true
-    SOURCE="${AUDIO_SOURCE:-}"
-fi
+SOURCE="${AUDIO_SOURCE:-}"
 
 echo "=== Mic test (speak when recording starts) ==="
 echo "Source: ${SOURCE:-system default}"
@@ -42,7 +43,7 @@ if [[ "${SZ}" -lt 1000 ]]; then
 fi
 
 echo "Transcribing…"
-OUT=$("${CLI}" -m "${MODEL}" -f "${WAV}" -nt -np -t 4 2>/dev/null | grep -v '^\[' | tail -1)
+OUT=$("${CLI}" -m "${MODEL}" -f "${WAV}" -nt -np -t "${WHISPER_THREADS:-4}" 2>/dev/null | grep -v '^\[' | tail -1)
 rm -f "${WAV}"
 if [[ -z "${OUT}" || "${OUT}" == *"BLANK_AUDIO"* ]]; then
     echo "FAIL: whisper heard silence. Check mic volume / mute / wrong device."

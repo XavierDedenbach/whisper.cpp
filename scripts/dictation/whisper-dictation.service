@@ -1,6 +1,6 @@
 [Unit]
 Description=Whisper Ctrl+Space dictation daemon
-After=pipewire.service pipewire-pulse.service sound.target
+After=pipewire.service pipewire-pulse.service sound.target whisper-dictation-server.service
 Wants=pipewire.service
 
 [Service]

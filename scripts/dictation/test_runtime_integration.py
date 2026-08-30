@@ -1,0 +1,694 @@
+#!/usr/bin/env python3
+"""Focused integration tests for dictation runtime/build selection."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from dictation import Dictation  # noqa: E402
+
+
+def write_executable(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
+
+
+class RuntimeSelectionTests(unittest.TestCase):
+    def run_fake_server_check(
+        self,
+        temp: Path,
+        *,
+        accelerator: str = "sycl",
+        cli_reports_accelerator: bool = True,
+        sycl_device: str = "0",
+        sycl_device_name: str = "Intel Iris Xe Graphics",
+        sycl_expected_device: str = "",
+        curl_fails: bool = False,
+        server_matches: bool = True,
+        malformed_response: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        home = temp / "home"
+        config_dir = home / ".config/whisper-dictation"
+        config_dir.mkdir(parents=True)
+        repo = temp / "repo"
+        bin_dir = repo / f"build-{accelerator}/bin"
+        bin_dir.mkdir(parents=True)
+        (repo / "models").mkdir()
+        (repo / "samples").mkdir()
+        (repo / "scripts/dictation/.venv/bin").mkdir(parents=True)
+        (repo / "models/ggml-small.en.bin").write_bytes(b"model")
+        (repo / "samples/jfk.wav").write_bytes(b"wav")
+        setvars = temp / "setvars.sh"
+        setvars.write_text("export FAKE_ONEAPI_READY=1\n", encoding="utf-8")
+        (config_dir / "install.env").write_text(
+            f'WHISPER_REPO_ROOT="{repo}"\n', encoding="utf-8"
+        )
+        (config_dir / "config.env").write_text(
+            'WHISPER_MODEL="small.en"\n'
+            f'WHISPER_BUILD_DIR="build-{accelerator}"\n'
+            f'WHISPER_ACCELERATOR="{accelerator}"\n'
+            f'WHISPER_ONEAPI_SETVARS="{setvars}"\n'
+            f'WHISPER_SYCL_DEVICE="{sycl_device}"\n'
+            f'WHISPER_SYCL_EXPECTED_DEVICE="{sycl_expected_device}"\n'
+            'WHISPER_BACKEND="server"\n'
+            'WHISPER_SERVER_URL="http://127.0.0.1:18178"\n',
+            encoding="utf-8",
+        )
+        if accelerator == "sycl":
+            backend_log = (
+                'printf "whisper_backend_init_gpu: using SYCL0 backend\\n" >&2\n'
+                f'printf "[level_zero:gpu:{sycl_device}] {sycl_device_name}\\n" >&2\n'
+            )
+        else:
+            backend_log = (
+                'printf "ggml_cuda_init: found 1 CUDA devices\\n" >&2\n'
+                'printf "whisper_backend_init_gpu: using CUDA0 backend\\n" >&2\n'
+            )
+        if not cli_reports_accelerator:
+            backend_log = ""
+        write_executable(
+            bin_dir / "whisper-cli",
+            "#!/usr/bin/env bash\n" + backend_log + 'printf "transcript\\n"\n',
+        )
+        write_executable(bin_dir / "whisper-server", "#!/usr/bin/env bash\nexit 0\n")
+        write_executable(
+            repo / "scripts/dictation/.venv/bin/python",
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+        fake_bin = temp / "bin"
+        for command in ("pw-record", "xdotool", "xclip"):
+            write_executable(fake_bin / command, "#!/usr/bin/env bash\nexit 0\n")
+        write_executable(
+            fake_bin / "sycl-ls",
+            "#!/usr/bin/env bash\n"
+            f'printf "[level_zero:gpu][level_zero:{sycl_device}] {sycl_device_name}\\n"\n',
+        )
+        write_executable(
+            fake_bin / "systemctl",
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *"show"* ]]; then printf "1234\\n"; fi\n'
+            "exit 0\n",
+        )
+        write_executable(
+            fake_bin / "pgrep",
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *"-P 1234"* ]]; then printf "4321\\n"; fi\n',
+        )
+        selected_server = str(bin_dir / "whisper-server")
+        reported_server = (
+            selected_server if server_matches else str(temp / "cpu/whisper-server")
+        )
+        write_executable(
+            fake_bin / "readlink",
+            f'#!/usr/bin/env bash\nprintf "%s\\n" "{reported_server}"\n',
+        )
+        if curl_fails:
+            curl_body = "exit 7\n"
+        elif malformed_response:
+            curl_body = "printf '{\"text\":'\n"
+        else:
+            curl_body = 'printf \'{"text":"ok"}\'\n'
+        write_executable(fake_bin / "curl", f"#!/usr/bin/env bash\n{curl_body}")
+        env = os.environ.copy()
+        env.update({"HOME": str(home), "PATH": f"{fake_bin}:/usr/bin:/bin"})
+        return subprocess.run(
+            ["bash", str(SCRIPT_DIR / "check.sh")],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+
+    def run_autostart_install(self, temp: Path) -> tuple[Path, list[str]]:
+        home = temp / "home"
+        config_dir = home / ".config/whisper-dictation"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.env").write_text(
+            'WHISPER_BACKEND="server"\n'
+            'WHISPER_BUILD_DIR="build-sycl"\n'
+            'WHISPER_ACCELERATOR="sycl"\n',
+            encoding="utf-8",
+        )
+        event_log = temp / "systemctl.log"
+        fake_bin = temp / "bin"
+        write_executable(
+            fake_bin / "systemctl",
+            '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "${EVENT_LOG}"\n',
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "EVENT_LOG": str(event_log),
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "XDG_RUNTIME_DIR": str(temp / "runtime"),
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(SCRIPT_DIR / "install.sh"), "--autostart-only"],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = event_log.read_text(encoding="utf-8").splitlines()
+        return home, events
+
+    def test_dictation_build_directory_defaults_to_build(self) -> None:
+        with mock.patch("dictation.build_recorder_cmd", return_value=["parecord"]):
+            app = Dictation({"WHISPER_HOME": str(REPO_ROOT)})
+        self.assertEqual(app.cli, REPO_ROOT / "build/bin/whisper-cli")
+
+    def test_dictation_build_directory_override(self) -> None:
+        with mock.patch("dictation.build_recorder_cmd", return_value=["parecord"]):
+            app = Dictation(
+                {
+                    "WHISPER_HOME": str(REPO_ROOT),
+                    "WHISPER_BUILD_DIR": "build-sycl",
+                }
+            )
+        self.assertEqual(app.cli, REPO_ROOT / "build-sycl/bin/whisper-cli")
+
+    def test_runtime_env_selects_sycl_and_sources_oneapi(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            home = temp / "home"
+            config_dir = home / ".config/whisper-dictation"
+            config_dir.mkdir(parents=True)
+            repo = temp / "repo"
+            repo.mkdir()
+            event_log = temp / "events.log"
+            setvars = temp / "setvars.sh"
+            setvars.write_text(
+                'export FAKE_ONEAPI_READY="1"\nprintf "oneapi\\n" >> "${EVENT_LOG}"\n',
+                encoding="utf-8",
+            )
+            (config_dir / "install.env").write_text(
+                f'WHISPER_REPO_ROOT="{repo}"\n', encoding="utf-8"
+            )
+            (config_dir / "config.env").write_text(
+                'WHISPER_BUILD_DIR="build-sycl"\n'
+                'WHISPER_ACCELERATOR="sycl"\n'
+                f'WHISPER_ONEAPI_SETVARS="{setvars}"\n'
+                'WHISPER_ONEAPI_DEVICE_SELECTOR="level_zero:gpu"\n'
+                'WHISPER_SYCL_DEVICE="0"\n',
+                encoding="utf-8",
+            )
+
+            command = (
+                f'source "{SCRIPT_DIR / "runtime-env.sh"}"; '
+                "whisper_dictation_load_runtime; "
+                'printf "bin=%s\\noneapi=%s\\nselector=%s\\ndevice=%s\\n" '
+                '"${WHISPER_BIN_DIR}" "${FAKE_ONEAPI_READY:-0}" '
+                '"${ONEAPI_DEVICE_SELECTOR:-}" "${GGML_SYCL_DEVICE:-}"'
+            )
+            env = os.environ.copy()
+            env.update({"HOME": str(home), "EVENT_LOG": str(event_log)})
+            result = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=5,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"bin={repo / 'build-sycl/bin'}", result.stdout)
+            self.assertIn("oneapi=1", result.stdout)
+            self.assertIn("selector=level_zero:gpu", result.stdout)
+            self.assertIn("device=0", result.stdout)
+            self.assertEqual(event_log.read_text(encoding="utf-8"), "oneapi\n")
+
+    def test_runtime_env_auto_selects_cpu_from_build_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            home = temp / "home"
+            config_dir = home / ".config/whisper-dictation"
+            config_dir.mkdir(parents=True)
+            repo = temp / "repo"
+            repo.mkdir()
+            (config_dir / "install.env").write_text(
+                f'WHISPER_REPO_ROOT="{repo}"\n', encoding="utf-8"
+            )
+            (config_dir / "config.env").write_text(
+                'WHISPER_BUILD_DIR="build"\n'
+                'WHISPER_ACCELERATOR="auto"\n'
+                'WHISPER_ONEAPI_SETVARS="/definitely/missing/setvars.sh"\n',
+                encoding="utf-8",
+            )
+            command = (
+                f'source "{SCRIPT_DIR / "runtime-env.sh"}"; '
+                "whisper_dictation_load_runtime; "
+                'printf "bin=%s\\naccelerator=%s\\n" '
+                '"${WHISPER_BIN_DIR}" "${WHISPER_ACCELERATOR}"'
+            )
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            result = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"bin={repo / 'build/bin'}", result.stdout)
+            self.assertIn("accelerator=\n", result.stdout)
+
+    def test_runtime_env_auto_selects_cuda_from_build_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            home = temp / "home"
+            config_dir = home / ".config/whisper-dictation"
+            config_dir.mkdir(parents=True)
+            repo = temp / "repo"
+            (repo / "build").mkdir(parents=True)
+            (repo / "build/CMakeCache.txt").write_text(
+                "GGML_CUDA:BOOL=ON\n", encoding="utf-8"
+            )
+            (config_dir / "install.env").write_text(
+                f'WHISPER_REPO_ROOT="{repo}"\n', encoding="utf-8"
+            )
+            (config_dir / "config.env").write_text(
+                'WHISPER_BUILD_DIR="build"\n'
+                'WHISPER_ACCELERATOR="auto"\n'
+                'WHISPER_SYCL_EXPECTED_DEVICE="Wrong device"\n',
+                encoding="utf-8",
+            )
+            command = (
+                f'source "{SCRIPT_DIR / "runtime-env.sh"}"; '
+                "whisper_dictation_load_runtime; "
+                'printf "accelerator=%s\\n" "${WHISPER_ACCELERATOR}"'
+            )
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            result = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("accelerator=cuda", result.stdout)
+
+    def test_runtime_env_caller_build_override_wins_over_user_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            home = temp / "home"
+            config_dir = home / ".config/whisper-dictation"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.env").write_text(
+                'WHISPER_BUILD_DIR="build"\nWHISPER_ACCELERATOR="auto"\n',
+                encoding="utf-8",
+            )
+            setvars = temp / "setvars.sh"
+            setvars.write_text("export OVERRIDE_ONEAPI=1\n", encoding="utf-8")
+            custom_build = temp / "custom-sycl"
+            command = (
+                f'source "{SCRIPT_DIR / "runtime-env.sh"}"; '
+                "whisper_dictation_load_runtime; "
+                'printf "build=%s\\naccelerator=%s\\noneapi=%s\\nexpected=%s\\n" '
+                '"${WHISPER_RESOLVED_BUILD_DIR}" "${WHISPER_ACCELERATOR}" '
+                '"${OVERRIDE_ONEAPI:-0}" "${WHISPER_SYCL_EXPECTED_DEVICE}"'
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "WHISPER_BUILD_DIR": str(custom_build),
+                    "WHISPER_ACCELERATOR": "sycl",
+                    "WHISPER_ONEAPI_SETVARS": str(setvars),
+                    "WHISPER_SYCL_EXPECTED_DEVICE": "Intel Arc Graphics",
+                }
+            )
+            result = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"build={custom_build}", result.stdout)
+            self.assertIn("accelerator=sycl", result.stdout)
+            self.assertIn("oneapi=1", result.stdout)
+            self.assertIn("expected=Intel Arc Graphics", result.stdout)
+
+    def test_build_sycl_helper_configures_supported_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            fake_bin = temp / "bin"
+            event_log = temp / "cmake.log"
+            setvars = temp / "setvars.sh"
+            setvars.write_text("export FAKE_ONEAPI_READY=1\n", encoding="utf-8")
+            write_executable(
+                fake_bin / "sycl-ls",
+                "#!/usr/bin/env bash\n"
+                'printf "[level_zero:gpu][level_zero:1] Intel(R) Arc(TM) Graphics\\n"\n',
+            )
+            write_executable(
+                fake_bin / "cmake",
+                '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "${EVENT_LOG}"\n',
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "EVENT_LOG": str(event_log),
+                    "WHISPER_ONEAPI_SETVARS": str(setvars),
+                    "WHISPER_SYCL_DEVICE": "1",
+                    "WHISPER_SYCL_EXPECTED_DEVICE": "Intel Arc Graphics",
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(SCRIPT_DIR / "build-sycl.sh"),
+                    "--build-dir",
+                    str(temp / "build-sycl"),
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = event_log.read_text(encoding="utf-8")
+            self.assertIn("-DGGML_SYCL=ON", calls)
+            self.assertIn("-DGGML_SYCL_SUPPORT_LEVEL_ZERO=ON", calls)
+            self.assertIn("-DGGML_SYCL_F16=OFF", calls)
+            self.assertIn("--target whisper-cli whisper-server", calls)
+            self.assertNotIn("ls-sycl-device", calls)
+
+    def test_build_cuda_helper_configures_supported_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            fake_bin = temp / "bin"
+            event_log = temp / "cmake.log"
+            write_executable(fake_bin / "nvcc", "#!/usr/bin/env bash\nexit 0\n")
+            write_executable(
+                fake_bin / "cmake",
+                '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "${EVENT_LOG}"\n',
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "EVENT_LOG": str(event_log),
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(SCRIPT_DIR / "build-cuda.sh"),
+                    "--build-dir",
+                    str(temp / "build-cuda"),
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = event_log.read_text(encoding="utf-8")
+            self.assertIn("-DGGML_CUDA=ON", calls)
+            self.assertIn("--target whisper-cli whisper-server", calls)
+
+    def test_check_rejects_cpu_binary_when_sycl_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            home = temp / "home"
+            config_dir = home / ".config/whisper-dictation"
+            config_dir.mkdir(parents=True)
+            (config_dir / "install.env").write_text(
+                f'WHISPER_REPO_ROOT="{REPO_ROOT}"\n', encoding="utf-8"
+            )
+            (config_dir / "config.env").write_text(
+                'WHISPER_MODEL="small.en"\n'
+                'WHISPER_BUILD_DIR="build"\n'
+                'WHISPER_ACCELERATOR="sycl"\n'
+                'WHISPER_ONEAPI_SETVARS="/opt/intel/oneapi/setvars.sh"\n'
+                'WHISPER_ONEAPI_DEVICE_SELECTOR="level_zero:gpu"\n'
+                'WHISPER_SYCL_DEVICE="0"\n'
+                'WHISPER_BACKEND="cli"\n',
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update({"HOME": str(home), "DISPLAY": os.environ.get("DISPLAY", ":0")})
+            result = subprocess.run(
+                ["bash", str(SCRIPT_DIR / "check.sh")],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("selected binary did not report SYCL", result.stdout)
+
+    def test_check_accepts_nonzero_intel_sycl_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_fake_server_check(
+                Path(tmp),
+                accelerator="sycl",
+                sycl_device="1",
+                sycl_device_name="Intel(R) Arc(TM) Graphics",
+                sycl_expected_device="Intel Arc Graphics",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(
+                "selected binary reports SYCL0 on [level_zero:gpu:1]",
+                result.stdout,
+            )
+
+    def test_check_enforces_optional_sycl_device_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_fake_server_check(
+                Path(tmp),
+                accelerator="sycl",
+                sycl_device_name="Intel Arc Graphics",
+                sycl_expected_device="Iris Xe",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("expected SYCL device name not found", result.stdout)
+
+    def test_shared_server_response_validator_rejects_malformed_json(self) -> None:
+        validator = SCRIPT_DIR / "validate-server-response.py"
+        malformed = subprocess.run(
+            [sys.executable, str(validator)],
+            input='{"text":',
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        empty = subprocess.run(
+            [sys.executable, str(validator)],
+            input='{"text":"  "}',
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        valid = subprocess.run(
+            [sys.executable, str(validator)],
+            input='{"text":"ready"}',
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertNotEqual(empty.returncode, 0)
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        run_server = (SCRIPT_DIR / "run-server.sh").read_text(encoding="utf-8")
+        self.assertIn("validate-server-response.py", run_server)
+
+    def test_check_rejects_cpu_binary_when_cuda_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_fake_server_check(
+                Path(tmp), accelerator="cuda", cli_reports_accelerator=False
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("selected binary did not report CUDA", result.stdout)
+
+    def test_check_accepts_selected_cuda_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_fake_server_check(Path(tmp), accelerator="cuda")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("selected binary reports CUDA0", result.stdout)
+
+    def test_check_rejects_unreachable_configured_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_fake_server_check(Path(tmp), curl_fails=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("server inference failed", result.stdout)
+
+    def test_check_rejects_mismatched_running_server_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_fake_server_check(Path(tmp), server_matches=False)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(
+                "running server does not match selected binary", result.stdout
+            )
+
+    def test_check_rejects_malformed_server_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_fake_server_check(Path(tmp), malformed_response=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("invalid or empty JSON response", result.stdout)
+
+    def test_run_server_warms_before_notifying_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            home = temp / "home"
+            config_dir = home / ".config/whisper-dictation"
+            config_dir.mkdir(parents=True)
+            repo = temp / "repo"
+            (repo / "build-sycl/bin").mkdir(parents=True)
+            (repo / "models").mkdir()
+            (repo / "samples").mkdir()
+            (repo / "models/ggml-small.en.bin").write_bytes(b"model")
+            (repo / "samples/jfk.wav").write_bytes(b"wav")
+            event_log = temp / "events.log"
+            server_pid_file = temp / "server.pid"
+            setvars = temp / "setvars.sh"
+            setvars.write_text(
+                'export FAKE_ONEAPI_READY="1"\nprintf "oneapi\\n" >> "${EVENT_LOG}"\n',
+                encoding="utf-8",
+            )
+            (config_dir / "install.env").write_text(
+                f'WHISPER_REPO_ROOT="{repo}"\n', encoding="utf-8"
+            )
+            (config_dir / "config.env").write_text(
+                'WHISPER_MODEL="small.en"\n'
+                'WHISPER_BUILD_DIR="build-sycl"\n'
+                'WHISPER_ACCELERATOR="sycl"\n'
+                f'WHISPER_ONEAPI_SETVARS="{setvars}"\n'
+                'WHISPER_SERVER_URL="http://127.0.0.1:18178"\n'
+                'WHISPER_SERVER_WARMUP="1"\n'
+                f'WHISPER_SERVER_WARMUP_AUDIO="{repo / "samples/jfk.wav"}"\n'
+                'WHISPER_SERVER_WARMUP_TIMEOUT="3"\n',
+                encoding="utf-8",
+            )
+
+            write_executable(
+                repo / "build-sycl/bin/whisper-server",
+                "#!/usr/bin/env bash\n"
+                '[[ "${FAKE_ONEAPI_READY:-0}" == "1" ]] || exit 42\n'
+                'printf "%s\\n" "$$" > "${SERVER_PID_FILE}"\n'
+                'printf "server-start\\n" >> "${EVENT_LOG}"\n'
+                'trap \'printf "server-stop\\n" >> "${EVENT_LOG}"; exit 0\' TERM INT\n'
+                "while true; do sleep 0.1; done\n",
+            )
+            fake_bin = temp / "bin"
+            write_executable(
+                fake_bin / "curl",
+                "#!/usr/bin/env bash\n"
+                "output=''\n"
+                "warm=0\n"
+                "previous=''\n"
+                'for arg in "$@"; do\n'
+                '  [[ "${previous}" == "-o" ]] && output="${arg}"\n'
+                '  [[ "${arg}" == file=@* ]] && warm=1\n'
+                '  previous="${arg}"\n'
+                "done\n"
+                'if [[ "${warm}" -eq 1 ]]; then\n'
+                '  printf "warmup\\n" >> "${EVENT_LOG}"\n'
+                '  if [[ -n "${output}" ]]; then printf \'{"text":"warm"}\' > "${output}"; else printf \'{"text":"warm"}\'; fi\n'
+                "else\n"
+                '  printf "probe\\n" >> "${EVENT_LOG}"\n'
+                "fi\n",
+            )
+            write_executable(
+                fake_bin / "systemd-notify",
+                '#!/usr/bin/env bash\nprintf "notify-ready\\n" >> "${EVENT_LOG}"\n',
+            )
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "EVENT_LOG": str(event_log),
+                    "SERVER_PID_FILE": str(server_pid_file),
+                    "NOTIFY_SOCKET": str(temp / "notify.sock"),
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                }
+            )
+            proc = subprocess.Popen(
+                ["bash", str(SCRIPT_DIR / "run-server.sh")],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                events: list[str] = []
+                while time.monotonic() < deadline:
+                    if event_log.exists():
+                        events = event_log.read_text(encoding="utf-8").splitlines()
+                    if "notify-ready" in events or proc.poll() is not None:
+                        break
+                    time.sleep(0.05)
+
+                stderr = ""
+                if proc.poll() is not None and proc.stderr:
+                    stderr = proc.stderr.read()
+                self.assertIn("server-start", events, stderr)
+                self.assertIn("warmup", events, stderr)
+                self.assertIn("notify-ready", events, stderr)
+                self.assertLess(events.index("server-start"), events.index("warmup"))
+                self.assertLess(events.index("warmup"), events.index("notify-ready"))
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                self.assertEqual(proc.wait(timeout=5), 0)
+                server_pid = int(server_pid_file.read_text(encoding="utf-8").strip())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(server_pid, 0)
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.stderr:
+                    proc.stderr.close()
+
+    def test_generated_launcher_loads_runtime_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, _ = self.run_autostart_install(Path(tmp))
+            launcher = (home / ".local/bin/whisper-dictation").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("runtime-env.sh", launcher)
+            self.assertIn("whisper_dictation_load_runtime", launcher)
+
+    def test_installer_starts_warm_server_before_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, events = self.run_autostart_install(Path(tmp))
+            server_restart = events.index(
+                "--user restart whisper-dictation-server.service"
+            )
+            daemon_restart = events.index("--user restart whisper-dictation.service")
+            self.assertLess(server_restart, daemon_restart)
+
+    def test_server_unit_waits_for_readiness_notification(self) -> None:
+        unit = (SCRIPT_DIR / "whisper-dictation-server.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Type=notify", unit)
+        self.assertIn("TimeoutStartSec=", unit)
+        self.assertIn("NotifyAccess=all", unit)
+        self.assertIn("KillMode=mixed", unit)
+
+
+if __name__ == "__main__":
+    unittest.main()

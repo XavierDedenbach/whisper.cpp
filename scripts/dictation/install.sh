@@ -60,6 +60,14 @@ if [[ ! -f "${INSTALL_ENV}" ]]; then
 fi
 # shellcheck disable=SC1090
 source "${INSTALL_ENV}"
+RUNTIME_ENV="${WHISPER_REPO_ROOT}/scripts/dictation/runtime-env.sh"
+if [[ ! -f "${RUNTIME_ENV}" ]]; then
+    echo "whisper-dictation: missing runtime helper at ${RUNTIME_ENV}" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "${RUNTIME_ENV}"
+whisper_dictation_load_runtime
 PY="${WHISPER_REPO_ROOT}/scripts/dictation/.venv/bin/python"
 APP="${WHISPER_REPO_ROOT}/scripts/dictation/dictation.py"
 if [[ ! -x "${PY}" ]]; then
@@ -196,18 +204,19 @@ install_autostart() {
 
     systemctl --user daemon-reload
     systemctl --user enable whisper-dictation.service
-    systemctl --user restart whisper-dictation.service 2>/dev/null || true
-    echo "    systemd: whisper-dictation.service (enabled, DISPLAY=${display})"
 
     if [[ "${backend}" == "server" ]]; then
         systemctl --user enable whisper-dictation-server.service
-        systemctl --user restart whisper-dictation-server.service 2>/dev/null || true
-        echo "    systemd: whisper-dictation-server.service (enabled; WHISPER_BACKEND=server)"
+        systemctl --user restart whisper-dictation-server.service
+        echo "    systemd: whisper-dictation-server.service (enabled and warm; WHISPER_BACKEND=server)"
     else
         systemctl --user disable whisper-dictation-server.service 2>/dev/null || true
         systemctl --user stop whisper-dictation-server.service 2>/dev/null || true
         echo "    systemd: whisper-dictation-server.service (disabled; set WHISPER_BACKEND=server to enable)"
     fi
+
+    systemctl --user restart whisper-dictation.service
+    echo "    systemd: whisper-dictation.service (enabled, DISPLAY=${display})"
 }
 
 if [[ "${AUTOSTART_ONLY}" -eq 1 ]]; then

@@ -4,7 +4,10 @@ After=network.target
 Before=whisper-dictation.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=180
+KillMode=mixed
 ExecStart=%SERVER_BIN%
 Restart=on-failure
 RestartSec=3
