@@ -21,6 +21,9 @@ SERVER_URL="${WHISPER_SERVER_URL:-http://127.0.0.1:8178}"
 WARMUP="${WHISPER_SERVER_WARMUP:-1}"
 WARMUP_AUDIO="${WHISPER_SERVER_WARMUP_AUDIO:-${ROOT}/samples/jfk.wav}"
 WARMUP_TIMEOUT="${WHISPER_SERVER_WARMUP_TIMEOUT:-120}"
+INFERENCE_WATCHDOG_SEC="${WHISPER_INFERENCE_WATCHDOG_SEC:-90}"
+SERVER_RECYCLE_SEC="${WHISPER_SERVER_RECYCLE_SEC:-21600}"
+WATCHDOG_POLL_SEC="${WHISPER_WATCHDOG_POLL_SEC:-1}"
 PY="${ROOT}/scripts/dictation/.venv/bin/python"
 VOCAB_PY="${ROOT}/scripts/dictation/vocab_prompt.py"
 RESPONSE_VALIDATOR="${SCRIPT_DIR}/validate-server-response.py"
@@ -91,10 +94,55 @@ forward_stop() {
         wait "${server_pid}" 2>/dev/null || true
     fi
 }
+whisper_inference_sockets_busy() {
+    local port="$1" out
+    command -v ss >/dev/null 2>&1 || return 1
+    out="$(ss -tn "sport = :${port}" 2>/dev/null || true)"
+    [[ "${out}" == *ESTAB* || "${out}" == *CLOSE-WAIT* ]]
+}
+
+watch_server() {
+    local poll="${WATCHDOG_POLL_SEC}"
+    local busy_since=""
+    while kill -0 "${server_pid}" 2>/dev/null; do
+        if whisper_inference_sockets_busy "${PORT}"; then
+            busy_since="${busy_since:-${SECONDS}}"
+            if [[ "${INFERENCE_WATCHDOG_SEC}" != "0" ]] \
+                && (( SECONDS - busy_since >= INFERENCE_WATCHDOG_SEC )); then
+                echo "whisper-dictation-server: inference watchdog: sockets stuck $((SECONDS - busy_since))s on :${PORT}; killing hung server" >&2
+                kill -TERM "${server_pid}" 2>/dev/null || true
+                sleep 2
+                kill -KILL "${server_pid}" 2>/dev/null || true
+                wait "${server_pid}" 2>/dev/null || true
+                server_pid=""
+                exit 1
+            fi
+        else
+            busy_since=""
+            if [[ "${SERVER_RECYCLE_SEC}" != "0" ]] \
+                && (( SECONDS >= SERVER_RECYCLE_SEC )); then
+                echo "whisper-dictation-server: idle recycle after ${SECONDS}s uptime" >&2
+                kill -TERM "${server_pid}" 2>/dev/null || true
+                wait "${server_pid}" 2>/dev/null || true
+                server_pid=""
+                exit 1
+            fi
+        fi
+        if [[ -n "${NOTIFY_SOCKET:-}" ]] && command -v systemd-notify >/dev/null; then
+            systemd-notify WATCHDOG=1 >/dev/null 2>&1 || true
+        fi
+        sleep "${poll}"
+    done
+}
+
 trap cleanup EXIT
 trap forward_stop INT TERM
 
-"${BIN}" "${args[@]}" &
+if command -v stdbuf >/dev/null; then
+    stdbuf -oL -eL "${BIN}" "${args[@]}" &
+else
+    "${BIN}" "${args[@]}" &
+fi
 server_pid=$!
 
 deadline=$((SECONDS + WARMUP_TIMEOUT))
@@ -151,10 +199,19 @@ if [[ -n "${NOTIFY_SOCKET:-}" ]] && command -v systemd-notify >/dev/null; then
 fi
 echo "whisper-dictation-server: ready at ${SERVER_URL}"
 
-if wait "${server_pid}"; then
-    server_status=0
+if [[ "${INFERENCE_WATCHDOG_SEC}" == "0" && "${SERVER_RECYCLE_SEC}" == "0" ]]; then
+    if wait "${server_pid}"; then
+        server_status=0
+    else
+        server_status=$?
+    fi
 else
-    server_status=$?
+    watch_server
+    if wait "${server_pid}"; then
+        server_status=0
+    else
+        server_status=$?
+    fi
 fi
 server_pid=""
 if [[ "${stopping}" -eq 1 ]]; then

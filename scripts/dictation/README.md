@@ -36,6 +36,8 @@ bash scripts/dictation/check.sh
 
 Focus any text field → **Ctrl+Space** → speak → **Ctrl+Space** → text is pasted.
 
+Keep talking past 45 seconds: the first slice pastes while the next slice is already recording. Press Ctrl+Space when you are done; the last partial slice pastes after that.
+
 A **silver dot** in the desktop top-panel tray shows dictation is running; it **blinks bright red** while recording. Notifications are 1 s each and replace the previous one.
 
 ---
@@ -234,6 +236,10 @@ File: `~/.config/whisper-dictation/config.env` (created on first install)
 | `WHISPER_SERVER_WARMUP` | `1` | Run one inference before the server reports ready |
 | `WHISPER_SERVER_WARMUP_AUDIO` | JFK sample | Optional warmup WAV override |
 | `WHISPER_SERVER_WARMUP_TIMEOUT` | `120` | Startup/warmup timeout in seconds |
+| `WHISPER_SERVER_TIMEOUT` | `90` | Client `/inference` curl budget in seconds |
+| `WHISPER_INFERENCE_WATCHDOG_SEC` | `90` | Kill and restart the server if an inference socket stays open this long (`0` disables) |
+| `WHISPER_SERVER_RECYCLE_SEC` | `21600` | Recycle a healthy idle server this often (6h) to shed Intel GPU hangs |
+| `MAX_RECORD_SEC` | `45` | Slice length. Auto-rolls into the next recording so long speech keeps landing in 45s pastes (`0` = unlimited single take) |
 | `WHISPER_LANGUAGE` | `en` | Language id |
 | `WHISPER_SUPPRESS_NST` | `1` | Suppress non-speech tokens |
 | `WHISPER_PROMPT_PREFIX` | `Technical dictation.` | Prefix for the vocabulary prompt |
@@ -265,6 +271,7 @@ systemctl --user restart whisper-dictation
 | Misheard words | Add the term to `scripts/dictation/vocabulary.txt` (see Terminology below), then restart |
 | Text pasted twice | Two daemons running — `rm ~/.config/autostart/whisper-dictation.desktop` then `systemctl --user restart whisper-dictation` |
 | Server fallback | Check `systemctl --user status whisper-dictation-server` |
+| Recording LED works but no text | SYCL server hung — `/health` still returns ok. `systemctl --user restart whisper-dictation-server`. A watchdog now kills stuck inferences automatically. |
 | First GPU request is slow | Keep `WHISPER_SERVER_WARMUP=1`; wait for the server unit to become `active` before dictating |
 | CUDA backend missing | Run `nvidia-smi`, confirm `nvcc` is installed, rebuild with `build-cuda.sh`, then run `check.sh` |
 | SYCL device missing | Source oneAPI and run `ONEAPI_DEVICE_SELECTOR=level_zero:gpu sycl-ls` |

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Global dictation: record mic -> whisper.cpp -> type into focused field.
 
-Toggle mode (default): Ctrl+Space to start, Ctrl+Space again to stop and paste.
+Toggle mode (default): Ctrl+Space to start, Ctrl+Space again to stop.
+Long utterances are sliced every MAX_RECORD_SEC: the filled slice is
+transcribed and pasted while the next slice is already recording.
 Uses scripts/dictation/.venv if present (created by install.sh).
 """
 
@@ -12,6 +14,7 @@ import fcntl
 import json
 import math
 import os
+import queue
 import signal
 import struct
 import subprocess
@@ -50,6 +53,37 @@ MODIFIER_KEYS = {
     "ctrl": {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r},
     "super": {keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r},
 }
+
+# notify-send -r requires an integer replace id (a string is ignored / errors).
+NOTIFY_REPLACE_ID = "4242"
+SERVER_UNIT = "whisper-dictation-server.service"
+_CHUNK_NO_SPACE_PREFIX = set(".,!?;:")
+
+
+def prefix_chunk_for_insert(need_space: bool, chunk: str) -> tuple[str, bool]:
+    """Return (text to paste, whether the next chunk needs a leading space)."""
+    chunk = " ".join(chunk.split())
+    if not chunk:
+        return "", need_space
+    if need_space and chunk[0] not in _CHUNK_NO_SPACE_PREFIX:
+        chunk = " " + chunk
+    return chunk, True
+
+
+def build_notify_cmd(title: str, msg: str, dwell_ms: int) -> list[str]:
+    return [
+        "notify-send",
+        "-a",
+        "whisper-dictation",
+        "-r",
+        NOTIFY_REPLACE_ID,
+        "-t",
+        str(dwell_ms),
+        "-h",
+        "int:transient:1",
+        title,
+        msg,
+    ]
 
 
 def build_recorder_cmd(
@@ -324,14 +358,18 @@ class Dictation:
         )
         self.language = cfg.get("WHISPER_LANGUAGE", "en").strip() or "en"
         self.suppress_nst = _truthy(cfg.get("WHISPER_SUPPRESS_NST", "1"))
+        self.max_record = float(cfg.get("MAX_RECORD_SEC", "45"))
+        self.server_timeout = float(cfg.get("WHISPER_SERVER_TIMEOUT", "90"))
+        self.cli_timeout = float(cfg.get("WHISPER_CLI_TIMEOUT", "90"))
 
         self._pressed: set = set()
         self._recording = False
         self._wav_path: str | None = None
         self._record_proc: subprocess.Popen | None = None
         self._record_start = 0.0
+        self._session_start = 0.0
         self._lock = threading.Lock()
-        self._busy = False
+        self._max_timer: threading.Timer | None = None
         self._recorder = build_recorder_cmd(self.audio_source, cfg)
         self._hotkey_chord_active = False  # ignore Space key-repeat until release
         self._hotkey_label_str = self._hotkey_label(cfg)
@@ -341,6 +379,17 @@ class Dictation:
         self._tray_enabled = _truthy(cfg.get("TRAY_INDICATOR", "1"))
         blink_s = float(cfg.get("INDICATOR_BLINK_SEC", "1.0"))
         self._tray = TrayIndicator(blink_interval_s=blink_s)
+        self._chunk_seq = 0
+        self._next_submit = 0
+        self._staged: dict[int, tuple[str, float, int]] = {}
+        self._chunk_queue: queue.Queue[tuple[str, float, int] | None] = queue.Queue()
+        self._session_id = 0
+        self._paste_session = -1
+        self._chunk_needs_space = False
+        self._worker = threading.Thread(
+            target=self._transcribe_worker, name="whisper-chunk-worker", daemon=True
+        )
+        self._worker.start()
 
     def _mods_active(self) -> bool:
         if not self.mod_groups:
@@ -359,22 +408,20 @@ class Dictation:
 
     def _on_hotkey(self) -> None:
         if self.hotkey_mode == "hold":
-            if not self._recording and not self._busy:
+            if not self._recording:
                 threading.Thread(target=self._start_recording, daemon=True).start()
             return
         # toggle: start or stop on each Ctrl+Space press
         if self._recording:
-            elapsed = time.monotonic() - self._record_start
+            elapsed = time.monotonic() - self._session_start
             if elapsed < self.min_toggle_stop:
                 self._notify(
                     f"Still recording ({elapsed:.1f}s) — speak, then {self._hotkey_label_str} to stop"
                 )
                 return
             threading.Thread(target=self._finish_recording, daemon=True).start()
-        elif not self._busy:
-            threading.Thread(target=self._start_recording, daemon=True).start()
         else:
-            self._notify("Transcribing previous recording…")
+            threading.Thread(target=self._start_recording, daemon=True).start()
 
     def on_press(self, key) -> None:
         self._pressed.add(key)
@@ -399,28 +446,91 @@ class Dictation:
         dwell_ms = self._notify_ms
         try:
             subprocess.run(
-                [
-                    "notify-send",
-                    "-a",
-                    "whisper-dictation",
-                    "-r",
-                    "whisper-dictation",
-                    "-t",
-                    str(dwell_ms),
-                    "-h",
-                    "int:transient:1",
-                    "Dictation",
-                    msg,
-                ],
+                build_notify_cmd("Dictation", msg, dwell_ms),
                 check=False,
                 timeout=2,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             print(msg, file=sys.stderr)
 
-    def _start_recording(self) -> None:
+    def _cancel_max_timer(self) -> None:
+        timer = self._max_timer
+        self._max_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _arm_max_timer(self) -> None:
+        self._cancel_max_timer()
+        if self.max_record <= 0:
+            return
+        timer = threading.Timer(self.max_record, self._on_max_record)
+        timer.daemon = True
+        self._max_timer = timer
+        timer.start()
+
+    def _on_max_record(self) -> None:
         with self._lock:
-            if self._recording or self._busy:
+            if not self._recording:
+                return
+        self._roll_recording()
+
+    def _spawn_recorder(self) -> tuple[subprocess.Popen, str] | None:
+        """Start parecord/pw-record into a new temp WAV. Caller holds no assumptions."""
+        if not self._recorder:
+            return None
+        fd, path = tempfile.mkstemp(suffix=".wav", prefix="whisper-dictation-")
+        os.close(fd)
+        wake_audio_source(self.audio_source)
+        try:
+            proc = subprocess.Popen(
+                [*self._recorder, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            os.unlink(path)
+            return None
+        return proc, path
+
+    def _stage_chunk(self, wav: str | None, duration: float, seq: int, session_id: int) -> None:
+        """Finalize-order gate: chunks enter the worker FIFO in seq order."""
+        if not wav:
+            return
+        with self._lock:
+            self._staged[seq] = (wav, duration, session_id)
+            while self._next_submit in self._staged:
+                item = self._staged.pop(self._next_submit)
+                self._chunk_queue.put(item)
+                self._next_submit += 1
+
+    def _transcribe_worker(self) -> None:
+        while True:
+            item = self._chunk_queue.get()
+            try:
+                if item is None:
+                    return
+                wav, duration, session_id = item
+                self._deliver_chunk(wav, duration, session_id)
+            finally:
+                self._chunk_queue.task_done()
+
+    def _insert_chunk(self, text: str, session_id: int) -> str:
+        if session_id != self._paste_session:
+            self._paste_session = session_id
+            self._chunk_needs_space = False
+        pasted, self._chunk_needs_space = prefix_chunk_for_insert(
+            self._chunk_needs_space, text
+        )
+        if pasted:
+            self._insert(pasted)
+        return pasted
+
+    def _start_recording(self) -> None:
+        started = False
+        hold = False
+        with self._lock:
+            if self._recording:
                 return
             if not self.cli.is_file():
                 self._notify(
@@ -430,106 +540,196 @@ class Dictation:
             if not self.model.is_file():
                 self._notify(f"Missing model {self.model.name}")
                 return
-            fd, path = tempfile.mkstemp(suffix=".wav", prefix="whisper-dictation-")
-            os.close(fd)
-            self._wav_path = path
             if not self._recorder:
                 self._notify("No recorder (parecord/pw-record/arecord); run install.sh")
-                os.unlink(path)
-                self._wav_path = None
                 return
-            wake_audio_source(self.audio_source)
-            try:
-                self._record_proc = subprocess.Popen(
-                    [*self._recorder, path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                )
-            except FileNotFoundError:
+            spawned = self._spawn_recorder()
+            if spawned is None:
                 self._notify(f"{self._recorder[0]} not found")
-                os.unlink(path)
-                self._wav_path = None
                 return
+            self._record_proc, self._wav_path = spawned
             self._recording = True
-            self._record_start = time.monotonic()
+            now = time.monotonic()
+            self._record_start = now
+            self._session_start = now
+            self._session_id += 1
             self._tray.set_recording(True)
-            if self.hotkey_mode == "toggle":
-                self._notify("Recording… (Ctrl+Space to stop)")
+            self._arm_max_timer()
+            started = True
+            hold = self.hotkey_mode != "toggle"
+        if started:
+            self._notify("Listening…" if hold else "Recording… (Ctrl+Space to stop)")
+
+    def _roll_recording(self) -> None:
+        """Keep listening: start the next slice, then transcribe the one that just filled."""
+        with self._lock:
+            if not self._recording:
+                return
+            old_proc = self._record_proc
+            old_wav = self._wav_path
+            duration = time.monotonic() - self._record_start
+            seq = self._chunk_seq
+            self._chunk_seq += 1
+            session_id = self._session_id
+            spawned = self._spawn_recorder()
+            if spawned is None:
+                self._recording = False
+                self._record_proc = None
+                self._wav_path = None
+                self._cancel_max_timer()
+                self._tray.set_recording(False)
             else:
-                self._notify("Listening…")
+                self._record_proc, self._wav_path = spawned
+                self._record_start = time.monotonic()
+                self._arm_max_timer()
+        graceful_stop_recorder(old_proc, old_wav, self.recorder_stop_flush_msec)
+        self._stage_chunk(old_wav, duration, seq, session_id)
+        if spawned is None:
+            self._notify("Recorder died — finishing this utterance")
 
     def _finish_recording(self) -> None:
         with self._lock:
             if not self._recording:
                 return
             self._recording = False
-            self._busy = True
+            self._cancel_max_timer()
             self._tray.set_recording(False)
             proc = self._record_proc
             wav = self._wav_path
             duration = time.monotonic() - self._record_start
-
+            seq = self._chunk_seq
+            self._chunk_seq += 1
+            session_id = self._session_id
+            self._record_proc = None
+            self._wav_path = None
         graceful_stop_recorder(proc, wav, self.recorder_stop_flush_msec)
+        self._stage_chunk(wav, duration, seq, session_id)
 
+    def _deliver_chunk(self, wav: str, duration: float, session_id: int) -> None:
+        listening = self._recording and session_id == self._session_id
         wav_bytes = os.path.getsize(wav) if wav and os.path.exists(wav) else 0
         if wav_bytes < 1000:
+            err = ""
+            if not listening:
+                hint = "check mic in Settings → Sound → Input"
+                if self.audio_source:
+                    hint = f"mic: {self.audio_source[:40]}… — {hint}"
+                self._notify(f"Recording empty ({wav_bytes} B). {hint}. {err}")
             if wav and os.path.exists(wav):
                 os.unlink(wav)
-            self._busy = False
-            err = ""
-            if proc and proc.stderr:
-                try:
-                    err = proc.stderr.read().decode(errors="replace")[:80]
-                except Exception:
-                    pass
-            hint = "check mic in Settings → Sound → Input"
-            if self.audio_source:
-                hint = f"mic: {self.audio_source[:40]}… — {hint}"
-            self._notify(f"Recording empty ({wav_bytes} B). {hint}. {err}")
             return
 
-        if not wav or duration < self.min_record:
+        if duration < self.min_record:
             if wav and os.path.exists(wav):
                 os.unlink(wav)
-            self._busy = False
-            self._notify("Too short — speak longer, then Ctrl+Space to stop")
+            if not listening:
+                self._notify("Too short — speak longer, then Ctrl+Space to stop")
             return
 
         rms = wav_rms(wav)
         if rms < self.min_audio_rms:
             if wav and os.path.exists(wav):
                 os.unlink(wav)
-            self._busy = False
-            self._notify(
-                f"No speech detected (mic level {rms:.0f}, need ≥{self.min_audio_rms:.0f}) — "
-                "check mic / wrong input device (run: bash scripts/dictation/test-mic.sh)"
-            )
+            if not listening:
+                self._notify(
+                    f"No speech detected (mic level {rms:.0f}, need ≥{self.min_audio_rms:.0f}) — "
+                    "check mic / wrong input device (run: bash scripts/dictation/test-mic.sh)"
+                )
             return
 
+        text = ""
         try:
             text = apply_replacements(self._transcribe(wav), self.replacements)
+        except Exception as exc:
+            print(f"whisper-dictation: transcription failed: {exc}", file=sys.stderr)
+            self._notify(f"Transcription failed: {str(exc)[:80]}")
+            return
         finally:
-            if os.path.exists(wav):
+            if wav and os.path.exists(wav):
                 os.unlink(wav)
-            self._busy = False
 
         if not text:
-            self._notify(
-                "No speech in recording — check mic level / wrong input device "
-                "(run: bash scripts/dictation/test-mic.sh)"
-            )
+            if not listening:
+                self._notify(
+                    "No speech in recording — check mic level / wrong input device "
+                    "(run: bash scripts/dictation/test-mic.sh)"
+                )
             return
 
         if is_likely_hallucination(text) and rms < self.min_audio_rms * 2:
-            self._notify(
-                f"Ignored likely silence hallucination ({text!r}) — try again with the mic closer"
-            )
+            if not listening:
+                self._notify(
+                    f"Ignored likely silence hallucination ({text!r}) — try again with the mic closer"
+                )
             return
 
-        self._insert(text)
-        preview = text if len(text) <= 60 else text[:57] + "…"
-        self._notify(f"Typed: {preview}")
+        pasted = self._insert_chunk(text, session_id)
+        preview = pasted.strip()
+        if len(preview) > 60:
+            preview = preview[:57] + "…"
+        listening = self._recording and session_id == self._session_id
+        if listening:
+            self._notify(f"Typed: {preview} (still listening…)")
+        else:
+            self._notify(f"Typed: {preview}")
+
+    def _cpu_fallback_cli(self) -> Path | None:
+        """CPU whisper-cli from the portable build/, if it is not the active GPU binary."""
+        cpu = self.home / "build" / "bin" / "whisper-cli"
+        try:
+            if cpu.is_file() and cpu.resolve() != self.cli.resolve():
+                return cpu
+        except OSError:
+            return None
+        return None
+
+    def _server_health_ok(self) -> bool:
+        try:
+            result = subprocess.run(
+                [
+                    "curl",
+                    "-fsS",
+                    "--connect-timeout",
+                    "1",
+                    "--max-time",
+                    "2",
+                    f"{self.server_url}/health",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        body = (result.stdout or "").lower()
+        return result.returncode == 0 and "ok" in body
+
+    def _restart_whisper_server(self) -> bool:
+        """Restart the warm server unit and wait until /health is ok."""
+        print(
+            "whisper-dictation: restarting hung whisper-dictation-server",
+            file=sys.stderr,
+        )
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "restart", SERVER_UNIT],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            print(f"whisper-dictation: server restart failed: {exc}", file=sys.stderr)
+            return False
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            print(f"whisper-dictation: server restart failed: {err}", file=sys.stderr)
+            return False
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if self._server_health_ok():
+                return True
+            time.sleep(0.2)
+        return False
 
     def _transcribe(self, wav_path: str) -> str:
         if self.backend == "server":
@@ -537,14 +737,29 @@ class Dictation:
             if text is not None:
                 return text
             print(
-                "whisper-dictation: server unavailable; falling back to whisper-cli",
+                "whisper-dictation: server unavailable; recovering (no GPU CLI fallback)",
                 file=sys.stderr,
             )
+            self._notify("Dictation server stuck — restarting…")
+            if self._restart_whisper_server():
+                text = self._transcribe_server(wav_path)
+                if text is not None:
+                    return text
+            cpu = self._cpu_fallback_cli()
+            if cpu is not None:
+                print(
+                    f"whisper-dictation: falling back to CPU whisper-cli ({cpu})",
+                    file=sys.stderr,
+                )
+                return self._transcribe_cli(wav_path, cli=cpu)
+            self._notify("Dictation server stuck — try again in a moment")
+            return ""
         return self._transcribe_cli(wav_path)
 
-    def _transcribe_cli(self, wav_path: str) -> str:
+    def _transcribe_cli(self, wav_path: str, cli: Path | None = None) -> str:
+        binary = cli or self.cli
         cmd = [
-            str(self.cli),
+            str(binary),
             "-m",
             str(self.model),
             "-f",
@@ -560,13 +775,17 @@ class Dictation:
             cmd.append("-sns")
         if self.prompt:
             cmd.extend(["--prompt", self.prompt])
-        result = subprocess.run(
-            cmd,
-            cwd=self.home,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=self.home,
+                capture_output=True,
+                text=True,
+                timeout=self.cli_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            self._notify("Local whisper-cli timed out")
+            return ""
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "transcription failed").strip()
             self._notify(err[:120])
@@ -577,13 +796,14 @@ class Dictation:
         """POST WAV to whisper-server. Return None to signal connection/HTTP failure."""
         if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
             return None
+        max_time = str(max(5, int(self.server_timeout)))
         cmd = [
             "curl",
             "-sS",
             "--connect-timeout",
             "2",
             "--max-time",
-            "300",
+            max_time,
             f"{self.server_url}/inference",
             "-F",
             f"file=@{wav_path}",
@@ -601,7 +821,12 @@ class Dictation:
         if self.suppress_nst:
             cmd.extend(["-F", "suppress_nst=true"])
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=310)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.server_timeout + 10,
+            )
         except subprocess.TimeoutExpired:
             return None
         if result.returncode != 0:

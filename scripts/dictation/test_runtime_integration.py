@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -578,7 +579,9 @@ class RuntimeSelectionTests(unittest.TestCase):
                 'WHISPER_SERVER_URL="http://127.0.0.1:18178"\n'
                 'WHISPER_SERVER_WARMUP="1"\n'
                 f'WHISPER_SERVER_WARMUP_AUDIO="{repo / "samples/jfk.wav"}"\n'
-                'WHISPER_SERVER_WARMUP_TIMEOUT="3"\n',
+                'WHISPER_SERVER_WARMUP_TIMEOUT="3"\n'
+                'WHISPER_INFERENCE_WATCHDOG_SEC="0"\n'
+                'WHISPER_SERVER_RECYCLE_SEC="0"\n',
                 encoding="utf-8",
             )
 
@@ -686,8 +689,229 @@ class RuntimeSelectionTests(unittest.TestCase):
         )
         self.assertIn("Type=notify", unit)
         self.assertIn("TimeoutStartSec=", unit)
+        self.assertIn("TimeoutStopSec=", unit)
+        self.assertIn("WatchdogSec=", unit)
         self.assertIn("NotifyAccess=all", unit)
         self.assertIn("KillMode=mixed", unit)
+
+
+class HangRecoveryTests(unittest.TestCase):
+    def test_notify_replace_id_is_integer(self) -> None:
+        from dictation import NOTIFY_REPLACE_ID, build_notify_cmd
+
+        cmd = build_notify_cmd("Dictation", "Recording…", 1000)
+        self.assertEqual(cmd[cmd.index("-r") + 1], NOTIFY_REPLACE_ID)
+        int(cmd[cmd.index("-r") + 1])  # must not raise
+
+    def _make_app(self, **cfg: str) -> Dictation:
+        defaults = {
+            "WHISPER_HOME": str(REPO_ROOT),
+            "WHISPER_BUILD_DIR": "build-sycl",
+            "WHISPER_BACKEND": "server",
+        }
+        defaults.update(cfg)
+        with mock.patch("dictation.build_recorder_cmd", return_value=["parecord"]):
+            return Dictation(defaults)
+
+    def test_server_timeout_restarts_then_retries_without_gpu_cli(self) -> None:
+        app = self._make_app()
+        app._transcribe_server = mock.Mock(side_effect=[None, "recovered text"])
+        app._restart_whisper_server = mock.Mock(return_value=True)
+        with mock.patch.object(app, "_notify"):
+            with mock.patch.object(app, "_transcribe_cli") as cli:
+                text = app._transcribe("/tmp/clip.wav")
+        self.assertEqual(text, "recovered text")
+        app._restart_whisper_server.assert_called_once()
+        self.assertEqual(app._transcribe_server.call_count, 2)
+        cli.assert_not_called()
+
+    def test_server_hang_falls_back_to_cpu_cli_not_sycl(self) -> None:
+        app = self._make_app()
+        app._transcribe_server = mock.Mock(return_value=None)
+        app._restart_whisper_server = mock.Mock(return_value=False)
+        cpu = Path("/tmp/cpu-whisper-cli")
+        with mock.patch.object(app, "_notify"):
+            with mock.patch.object(app, "_cpu_fallback_cli", return_value=cpu):
+                with mock.patch.object(
+                    app, "_transcribe_cli", return_value="cpu transcript"
+                ) as cli:
+                    text = app._transcribe("/tmp/clip.wav")
+        self.assertEqual(text, "cpu transcript")
+        cli.assert_called_once_with("/tmp/clip.wav", cli=cpu)
+
+    def test_cli_timeout_is_caught(self) -> None:
+        app = self._make_app(WHISPER_BACKEND="cli", WHISPER_CLI_TIMEOUT="1")
+        with mock.patch.object(app, "_notify"):
+            with mock.patch(
+                "dictation.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="whisper-cli", timeout=1),
+            ):
+                text = app._transcribe_cli("/tmp/clip.wav")
+        self.assertEqual(text, "")
+
+    def test_max_record_timer_rolls_to_next_slice(self) -> None:
+        app = self._make_app(MAX_RECORD_SEC="0.05")
+        app._recording = True
+        app._record_start = time.monotonic()
+        with mock.patch.object(app, "_notify"):
+            with mock.patch.object(app, "_roll_recording") as roll:
+                app._arm_max_timer()
+                deadline = time.monotonic() + 1.0
+                while not roll.called and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                try:
+                    roll.assert_called()
+                finally:
+                    app._cancel_max_timer()
+
+    def test_prefix_chunk_for_insert_adds_single_space(self) -> None:
+        from dictation import prefix_chunk_for_insert
+
+        text, need = prefix_chunk_for_insert(False, "  hello world  ")
+        self.assertEqual(text, "hello world")
+        self.assertTrue(need)
+        text, need = prefix_chunk_for_insert(True, "again")
+        self.assertEqual(text, " again")
+        self.assertTrue(need)
+        text, need = prefix_chunk_for_insert(True, ". Next")
+        self.assertEqual(text, ". Next")
+        empty, need = prefix_chunk_for_insert(True, "   ")
+        self.assertEqual(text, ". Next")
+        self.assertEqual(empty, "")
+        self.assertTrue(need)
+
+    def test_roll_starts_next_recorder_and_stages_old_wav(self) -> None:
+        app = self._make_app()
+        old_proc = mock.Mock()
+        new_proc = mock.Mock()
+        app._recording = True
+        app._session_id = 7
+        app._record_proc = old_proc
+        app._wav_path = "/tmp/old.wav"
+        app._record_start = time.monotonic() - 45
+        app._tray = mock.Mock()
+        with mock.patch.object(
+            app, "_spawn_recorder", return_value=(new_proc, "/tmp/new.wav")
+        ):
+            with mock.patch("dictation.graceful_stop_recorder") as stop:
+                with mock.patch.object(app, "_stage_chunk") as stage:
+                    app._roll_recording()
+        self.assertTrue(app._recording)
+        self.assertIs(app._record_proc, new_proc)
+        self.assertEqual(app._wav_path, "/tmp/new.wav")
+        stop.assert_called_once()
+        self.assertIs(stop.call_args[0][0], old_proc)
+        self.assertEqual(stop.call_args[0][1], "/tmp/old.wav")
+        stage.assert_called_once()
+        self.assertEqual(stage.call_args[0][0], "/tmp/old.wav")
+        self.assertEqual(stage.call_args[0][3], 7)
+
+    def test_user_stop_does_not_start_next_slice(self) -> None:
+        app = self._make_app()
+        proc = mock.Mock()
+        app._recording = True
+        app._record_proc = proc
+        app._wav_path = "/tmp/last.wav"
+        app._record_start = time.monotonic() - 5
+        app._session_start = app._record_start
+        app._tray = mock.Mock()
+        with mock.patch.object(app, "_spawn_recorder") as spawn:
+            with mock.patch("dictation.graceful_stop_recorder"):
+                with mock.patch.object(app, "_stage_chunk") as stage:
+                    app._finish_recording()
+        spawn.assert_not_called()
+        self.assertFalse(app._recording)
+        stage.assert_called_once()
+        self.assertEqual(stage.call_args[0][0], "/tmp/last.wav")
+
+    def test_chunks_enter_worker_in_seq_order(self) -> None:
+        app = self._make_app()
+        app._chunk_queue = queue.Queue()
+        app._next_submit = 0
+        app._staged = {}
+        app._stage_chunk("/tmp/b.wav", 1.0, 1, 3)
+        self.assertTrue(app._chunk_queue.empty())
+        app._stage_chunk("/tmp/a.wav", 1.0, 0, 3)
+        self.assertEqual(app._chunk_queue.get_nowait()[0], "/tmp/a.wav")
+        self.assertEqual(app._chunk_queue.get_nowait()[0], "/tmp/b.wav")
+
+    def test_run_server_kills_hung_inference_sockets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            home = temp / "home"
+            config_dir = home / ".config/whisper-dictation"
+            config_dir.mkdir(parents=True)
+            repo = temp / "repo"
+            (repo / "build-sycl/bin").mkdir(parents=True)
+            (repo / "models").mkdir()
+            (repo / "samples").mkdir()
+            (repo / "models/ggml-small.en.bin").write_bytes(b"model")
+            (repo / "samples/jfk.wav").write_bytes(b"wav")
+            event_log = temp / "events.log"
+            server_pid_file = temp / "server.pid"
+            setvars = temp / "setvars.sh"
+            setvars.write_text("export FAKE_ONEAPI_READY=1\n", encoding="utf-8")
+            (config_dir / "install.env").write_text(
+                f'WHISPER_REPO_ROOT="{repo}"\n', encoding="utf-8"
+            )
+            (config_dir / "config.env").write_text(
+                'WHISPER_MODEL="small.en"\n'
+                'WHISPER_BUILD_DIR="build-sycl"\n'
+                'WHISPER_ACCELERATOR="sycl"\n'
+                f'WHISPER_ONEAPI_SETVARS="{setvars}"\n'
+                'WHISPER_SERVER_URL="http://127.0.0.1:18178"\n'
+                'WHISPER_SERVER_WARMUP="1"\n'
+                f'WHISPER_SERVER_WARMUP_AUDIO="{repo / "samples/jfk.wav"}"\n'
+                'WHISPER_SERVER_WARMUP_TIMEOUT="3"\n'
+                'WHISPER_INFERENCE_WATCHDOG_SEC="1"\n'
+                'WHISPER_SERVER_RECYCLE_SEC="0"\n'
+                'WHISPER_WATCHDOG_POLL_SEC="0.2"\n',
+                encoding="utf-8",
+            )
+            write_executable(
+                repo / "build-sycl/bin/whisper-server",
+                "#!/usr/bin/env bash\n"
+                'printf "%s\\n" "$$" > "${SERVER_PID_FILE}"\n'
+                'trap \'printf "server-stop\\n" >> "${EVENT_LOG}"; exit 0\' TERM INT\n'
+                "while true; do sleep 0.1; done\n",
+            )
+            fake_bin = temp / "bin"
+            write_executable(
+                fake_bin / "curl",
+                "#!/usr/bin/env bash\n"
+                "output=''\n"
+                "previous=''\n"
+                'for arg in "$@"; do\n'
+                '  [[ "${previous}" == "-o" ]] && output="${arg}"\n'
+                '  previous="${arg}"\n'
+                "done\n"
+                'if [[ -n "${output}" ]]; then printf \'{"text":"warm"}\' > "${output}"; else printf \'{"text":"warm"}\'; fi\n',
+            )
+            write_executable(
+                fake_bin / "ss",
+                "#!/usr/bin/env bash\nprintf 'ESTAB 0 0 127.0.0.1:18178 127.0.0.1:9\\n'\n",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "EVENT_LOG": str(event_log),
+                    "SERVER_PID_FILE": str(server_pid_file),
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                }
+            )
+            result = subprocess.run(
+                ["bash", str(SCRIPT_DIR / "run-server.sh")],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=8,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("inference watchdog", result.stderr)
+            server_pid = int(server_pid_file.read_text(encoding="utf-8").strip())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(server_pid, 0)
 
 
 if __name__ == "__main__":
