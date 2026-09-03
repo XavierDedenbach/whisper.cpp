@@ -694,6 +694,12 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertIn("NotifyAccess=all", unit)
         self.assertIn("KillMode=mixed", unit)
 
+    def test_dictation_unit_allows_bounded_durable_handoff(self) -> None:
+        unit = (SCRIPT_DIR / "whisper-dictation.service").read_text(encoding="utf-8")
+        self.assertIn("KillMode=mixed", unit)
+        self.assertIn("KillSignal=SIGTERM", unit)
+        self.assertIn("TimeoutStopSec=15", unit)
+
 
 class HangRecoveryTests(unittest.TestCase):
     def test_notify_replace_id_is_integer(self) -> None:
@@ -825,15 +831,44 @@ class HangRecoveryTests(unittest.TestCase):
         self.assertEqual(stage.call_args[0][0], "/tmp/last.wav")
 
     def test_chunks_enter_worker_in_seq_order(self) -> None:
+        from session_store import ChunkJob
+
         app = self._make_app()
         app._chunk_queue = queue.Queue()
         app._next_submit = 0
         app._staged = {}
+        app._session_paths = {3: Path("/tmp/session")}
+        app._store = mock.Mock()
+        app._store.ingest.side_effect = lambda _session, seq, wav, duration, **kwargs: (
+            ChunkJob(
+                Path("/tmp/session"), seq, wav, duration, True, kwargs["paste_session"]
+            )
+        )
         app._stage_chunk("/tmp/b.wav", 1.0, 1, 3)
         self.assertTrue(app._chunk_queue.empty())
         app._stage_chunk("/tmp/a.wav", 1.0, 0, 3)
-        self.assertEqual(app._chunk_queue.get_nowait()[0], "/tmp/a.wav")
-        self.assertEqual(app._chunk_queue.get_nowait()[0], "/tmp/b.wav")
+        self.assertEqual(app._chunk_queue.get_nowait().wav_path, Path("/tmp/a.wav"))
+        self.assertEqual(app._chunk_queue.get_nowait().wav_path, Path("/tmp/b.wav"))
+
+    def test_failed_chunk_persistence_does_not_block_later_chunk(self) -> None:
+        from session_store import ChunkJob
+
+        app = self._make_app()
+        app._chunk_queue = queue.Queue()
+        app._next_submit = 0
+        app._staged = {}
+        app._session_paths = {3: Path("/tmp/session")}
+        later = ChunkJob(Path("/tmp/session"), 1, Path("/tmp/b.wav"), 1.0, True, 3)
+        app._store = mock.Mock()
+        app._store.ingest.side_effect = [OSError("disk error"), later]
+
+        app._stage_chunk("/tmp/a.wav", 1.0, 0, 3)
+        app._stage_chunk("/tmp/b.wav", 1.0, 1, 3)
+
+        self.assertIs(app._chunk_queue.get_nowait(), later)
+        app._store.record_gap.assert_called_once_with(
+            Path("/tmp/session"), 0, 1.0, "disk error"
+        )
 
     def test_run_server_kills_hung_inference_sockets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
