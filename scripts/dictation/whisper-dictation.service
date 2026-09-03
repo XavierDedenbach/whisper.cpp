@@ -8,6 +8,9 @@ Type=simple
 ExecStart=%LOCAL_BIN%
 Restart=on-failure
 RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=15
 
 # DISPLAY is substituted at install time from the current session ($DISPLAY).
 Environment=DISPLAY=%DISPLAY%

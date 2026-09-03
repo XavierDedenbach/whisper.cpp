@@ -41,6 +41,7 @@ except ImportError:
     sys.exit(1)
 
 from dictation_indicator import TrayIndicator, tray_indicator_available  # noqa: E402
+from session_store import ChunkJob, SessionStore  # noqa: E402
 from vocab_prompt import (  # noqa: E402
     apply_replacements,
     build_whisper_prompt,
@@ -361,6 +362,13 @@ class Dictation:
         self.max_record = float(cfg.get("MAX_RECORD_SEC", "45"))
         self.server_timeout = float(cfg.get("WHISPER_SERVER_TIMEOUT", "90"))
         self.cli_timeout = float(cfg.get("WHISPER_CLI_TIMEOUT", "90"))
+        session_root = cfg.get(
+            "WHISPER_SESSION_DIR",
+            "${HOME}/.local/share/whisper-dictation/sessions",
+        )
+        self._store = SessionStore(
+            Path(os.path.expanduser(os.path.expandvars(session_root)))
+        )
 
         self._pressed: set = set()
         self._recording = False
@@ -381,11 +389,15 @@ class Dictation:
         self._tray = TrayIndicator(blink_interval_s=blink_s)
         self._chunk_seq = 0
         self._next_submit = 0
-        self._staged: dict[int, tuple[str, float, int]] = {}
-        self._chunk_queue: queue.Queue[tuple[str, float, int] | None] = queue.Queue()
+        self._staged: dict[int, ChunkJob | None] = {}
+        self._chunk_queue: queue.Queue[ChunkJob | None] = queue.Queue()
         self._session_id = 0
+        self._session_paths: dict[int, Path] = {}
+        self._active_session: Path | None = None
         self._paste_session = -1
         self._chunk_needs_space = False
+        for job in self._store.recoverable(limit=32):
+            self._chunk_queue.put(job)
         self._worker = threading.Thread(
             target=self._transcribe_worker, name="whisper-chunk-worker", daemon=True
         )
@@ -493,15 +505,54 @@ class Dictation:
             return None
         return proc, path
 
-    def _stage_chunk(self, wav: str | None, duration: float, seq: int, session_id: int) -> None:
+    def _stage_chunk(
+        self, wav: str | None, duration: float, seq: int, session_id: int
+    ) -> None:
         """Finalize-order gate: chunks enter the worker FIFO in seq order."""
         if not wav:
+            self._submit_in_order(seq, None)
             return
+        session = self._session_paths.get(session_id)
+        if session is None:
+            print(
+                f"whisper-dictation: no durable session for chunk {seq}; preserving {wav}",
+                file=sys.stderr,
+            )
+            self._submit_in_order(seq, None)
+            return
+        try:
+            job = self._store.ingest(
+                session,
+                seq,
+                Path(wav),
+                duration,
+                paste=True,
+                paste_session=session_id,
+            )
+        except Exception as exc:
+            print(
+                f"whisper-dictation: could not persist chunk {seq}: {exc}",
+                file=sys.stderr,
+            )
+            try:
+                self._store.record_gap(session, seq, duration, str(exc))
+            except Exception as marker_exc:
+                print(
+                    f"whisper-dictation: could not record chunk {seq} gap: {marker_exc}",
+                    file=sys.stderr,
+                )
+            self._submit_in_order(seq, None)
+            return
+
+        self._submit_in_order(seq, job)
+
+    def _submit_in_order(self, seq: int, job: ChunkJob | None) -> None:
         with self._lock:
-            self._staged[seq] = (wav, duration, session_id)
+            self._staged[seq] = job
             while self._next_submit in self._staged:
                 item = self._staged.pop(self._next_submit)
-                self._chunk_queue.put(item)
+                if item is not None:
+                    self._chunk_queue.put(item)
                 self._next_submit += 1
 
     def _transcribe_worker(self) -> None:
@@ -510,8 +561,20 @@ class Dictation:
             try:
                 if item is None:
                     return
-                wav, duration, session_id = item
-                self._deliver_chunk(wav, duration, session_id)
+                try:
+                    self._deliver_chunk(item)
+                except Exception as exc:
+                    print(
+                        f"whisper-dictation: chunk {item.chunk_index} failed: {exc}",
+                        file=sys.stderr,
+                    )
+                    try:
+                        self._store.fail(item, detail=str(exc))
+                    except Exception as store_exc:
+                        print(
+                            f"whisper-dictation: could not record chunk failure: {store_exc}",
+                            file=sys.stderr,
+                        )
             finally:
                 self._chunk_queue.task_done()
 
@@ -553,6 +616,8 @@ class Dictation:
             self._record_start = now
             self._session_start = now
             self._session_id += 1
+            self._active_session = self._store.start_session()
+            self._session_paths[self._session_id] = self._active_session
             self._tray.set_recording(True)
             self._arm_max_timer()
             started = True
@@ -604,10 +669,15 @@ class Dictation:
             self._wav_path = None
         graceful_stop_recorder(proc, wav, self.recorder_stop_flush_msec)
         self._stage_chunk(wav, duration, seq, session_id)
+        self._store.stop_session(self._session_paths.get(session_id))
 
-    def _deliver_chunk(self, wav: str, duration: float, session_id: int) -> None:
-        listening = self._recording and session_id == self._session_id
-        wav_bytes = os.path.getsize(wav) if wav and os.path.exists(wav) else 0
+    def _deliver_chunk(self, job: ChunkJob) -> None:
+        wav = str(job.wav_path)
+        duration = job.duration
+        session_id = job.paste_session
+        listening = job.paste and self._recording and session_id == self._session_id
+        self._store.begin(job)
+        wav_bytes = os.path.getsize(wav) if os.path.exists(wav) else 0
         if wav_bytes < 1000:
             err = ""
             if not listening:
@@ -615,21 +685,23 @@ class Dictation:
                 if self.audio_source:
                     hint = f"mic: {self.audio_source[:40]}… — {hint}"
                 self._notify(f"Recording empty ({wav_bytes} B). {hint}. {err}")
-            if wav and os.path.exists(wav):
-                os.unlink(wav)
+            status = "missing" if not os.path.exists(wav) else "no_text"
+            self._store.terminal(job, status, f"audio file is {wav_bytes} bytes")
             return
 
         if duration < self.min_record:
-            if wav and os.path.exists(wav):
-                os.unlink(wav)
+            self._store.terminal(job, "ignored", "recording was too short")
             if not listening:
                 self._notify("Too short — speak longer, then Ctrl+Space to stop")
             return
 
-        rms = wav_rms(wav)
+        try:
+            rms = wav_rms(wav)
+        except (EOFError, wave.Error) as exc:
+            self._store.fail(job, "corrupt", str(exc))
+            return
         if rms < self.min_audio_rms:
-            if wav and os.path.exists(wav):
-                os.unlink(wav)
+            self._store.terminal(job, "silent", f"RMS {rms:.0f}")
             if not listening:
                 self._notify(
                     f"No speech detected (mic level {rms:.0f}, need ≥{self.min_audio_rms:.0f}) — "
@@ -643,12 +715,11 @@ class Dictation:
         except Exception as exc:
             print(f"whisper-dictation: transcription failed: {exc}", file=sys.stderr)
             self._notify(f"Transcription failed: {str(exc)[:80]}")
+            self._store.fail(job, detail=str(exc))
             return
-        finally:
-            if wav and os.path.exists(wav):
-                os.unlink(wav)
 
         if not text:
+            self._store.terminal(job, "no_text", "transcription returned no text")
             if not listening:
                 self._notify(
                     "No speech in recording — check mic level / wrong input device "
@@ -657,12 +728,16 @@ class Dictation:
             return
 
         if is_likely_hallucination(text) and rms < self.min_audio_rms * 2:
+            self._store.terminal(job, "ignored", f"likely hallucination: {text[:80]}")
             if not listening:
                 self._notify(
                     f"Ignored likely silence hallucination ({text!r}) — try again with the mic closer"
                 )
             return
 
+        self._store.complete(job, text)
+        if not job.paste:
+            return
         pasted = self._insert_chunk(text, session_id)
         preview = pasted.strip()
         if len(preview) > 60:
@@ -672,6 +747,16 @@ class Dictation:
             self._notify(f"Typed: {preview} (still listening…)")
         else:
             self._notify(f"Typed: {preview}")
+
+    def shutdown(self, drain_seconds: float = 5.0) -> None:
+        """Finalize active audio and leave queued work recoverable for next start."""
+        if self._recording:
+            self._finish_recording()
+        else:
+            self._store.stop_session(self._active_session)
+        deadline = time.monotonic() + drain_seconds
+        while self._chunk_queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.05)
 
     def _cpu_fallback_cli(self) -> Path | None:
         """CPU whisper-cli from the portable build/, if it is not the active GPU binary."""
@@ -924,7 +1009,15 @@ class Dictation:
 
 def main() -> None:
     acquire_singleton_lock()
-    Dictation(load_config()).run()
+    app = Dictation(load_config())
+
+    def stop(_signum: int, _frame: object) -> None:
+        app.shutdown()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    app.run()
 
 
 if __name__ == "__main__":
