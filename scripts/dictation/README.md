@@ -189,7 +189,10 @@ systemctl --user restart whisper-dictation-server whisper-dictation
 systemctl --user restart whisper-dictation-server whisper-dictation
 ```
 
-If the server is down, the daemon falls back to `whisper-cli` automatically.
+Server requests use text-only decoding without timestamps. If a non-silent
+chunk returns only punctuation or no text, the daemon retries once through the
+same selected CPU, CUDA, or SYCL server with beam search. It may restart that
+server once before using the portable CPU `whisper-cli` as the final fallback.
 
 ---
 
