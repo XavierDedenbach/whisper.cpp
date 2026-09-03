@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import wave
 from pathlib import Path
 
@@ -278,6 +279,7 @@ _HALLUCINATION_PHRASES = (
     "please subscribe",
     "see you next time",
     "the end",
+    "end of video",
     "bye",
     "goodbye",
     "subtitle",
@@ -300,7 +302,17 @@ def wav_rms(path: str) -> float:
     return math.sqrt(mean_sq)
 
 
+def is_punctuation_only(text: str) -> bool:
+    """Return whether Whisper produced punctuation without any spoken text."""
+    compact = "".join(text.split())
+    return bool(compact) and all(
+        unicodedata.category(char).startswith("P") for char in compact
+    )
+
+
 def is_likely_hallucination(text: str) -> bool:
+    if is_punctuation_only(text):
+        return True
     normalized = " ".join(text.strip().lower().rstrip(".!?").split())
     if not normalized:
         return True
@@ -727,7 +739,9 @@ class Dictation:
                 )
             return
 
-        if is_likely_hallucination(text) and rms < self.min_audio_rms * 2:
+        if is_punctuation_only(text) or (
+            is_likely_hallucination(text) and rms < self.min_audio_rms * 2
+        ):
             self._store.terminal(job, "ignored", f"likely hallucination: {text[:80]}")
             if not listening:
                 self._notify(
@@ -819,17 +833,41 @@ class Dictation:
     def _transcribe(self, wav_path: str) -> str:
         if self.backend == "server":
             text = self._transcribe_server(wav_path)
-            if text is not None:
+            if self._valid_server_text(text):
                 return text
-            print(
-                "whisper-dictation: server unavailable; recovering (no GPU CLI fallback)",
-                file=sys.stderr,
-            )
+
+            restart_beam_size: int | None = None
+            if text is None:
+                print(
+                    "whisper-dictation: server unavailable; recovering "
+                    "(no accelerator CLI fallback)",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"whisper-dictation: server returned unusable text {text!r}; "
+                    "retrying with beam search",
+                    file=sys.stderr,
+                )
+                text = self._transcribe_server(wav_path, beam_size=5)
+                if self._valid_server_text(text):
+                    return text
+                restart_beam_size = 5
+
             self._notify("Dictation server stuck — restarting…")
             if self._restart_whisper_server():
-                text = self._transcribe_server(wav_path)
-                if text is not None:
+                if restart_beam_size is None:
+                    text = self._transcribe_server(wav_path)
+                else:
+                    text = self._transcribe_server(
+                        wav_path, beam_size=restart_beam_size
+                    )
+                if self._valid_server_text(text):
                     return text
+                if restart_beam_size is None and text is not None:
+                    text = self._transcribe_server(wav_path, beam_size=5)
+                    if self._valid_server_text(text):
+                        return text
             cpu = self._cpu_fallback_cli()
             if cpu is not None:
                 print(
@@ -840,6 +878,10 @@ class Dictation:
             self._notify("Dictation server stuck — try again in a moment")
             return ""
         return self._transcribe_cli(wav_path)
+
+    @staticmethod
+    def _valid_server_text(text: str | None) -> bool:
+        return bool(text and not is_punctuation_only(text))
 
     def _transcribe_cli(self, wav_path: str, cli: Path | None = None) -> str:
         binary = cli or self.cli
@@ -877,7 +919,9 @@ class Dictation:
             return ""
         return parse_transcript_output(result.stdout)
 
-    def _transcribe_server(self, wav_path: str) -> str | None:
+    def _transcribe_server(
+        self, wav_path: str, *, beam_size: int | None = None
+    ) -> str | None:
         """POST WAV to whisper-server. Return None to signal connection/HTTP failure."""
         if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
             return None
@@ -895,10 +939,16 @@ class Dictation:
             "-F",
             "temperature=0.0",
             "-F",
+            "no_timestamps=true",
+            "-F",
+            "token_timestamps=false",
+            "-F",
             "response_format=json",
             "-F",
             f"language={self.language}",
         ]
+        if beam_size is not None:
+            cmd.extend(["-F", f"beam_size={beam_size}"])
         if self.prompt:
             cmd.extend(["-F", f"prompt={self.prompt}"])
         if self.carry_initial_prompt:

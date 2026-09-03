@@ -719,6 +719,167 @@ class HangRecoveryTests(unittest.TestCase):
         with mock.patch("dictation.build_recorder_cmd", return_value=["parecord"]):
             return Dictation(defaults)
 
+    def test_server_request_uses_no_timestamp_greedy_profile(self) -> None:
+        for build_dir in ("build", "build-cuda", "build-sycl"):
+            with self.subTest(build_dir=build_dir):
+                app = self._make_app(WHISPER_BUILD_DIR=build_dir)
+                which = subprocess.CompletedProcess(["which", "curl"], 0, "", "")
+                response = subprocess.CompletedProcess(
+                    ["curl"], 0, '{"text":"hello world"}', ""
+                )
+                with mock.patch(
+                    "dictation.subprocess.run", side_effect=[which, response]
+                ) as run:
+                    text = app._transcribe_server("/tmp/clip.wav")
+                self.assertEqual(text, "hello world")
+                cmd = run.call_args_list[1].args[0]
+                self.assertIn("no_timestamps=true", cmd)
+                self.assertIn("token_timestamps=false", cmd)
+                self.assertNotIn("beam_size=5", cmd)
+
+    def test_server_request_can_select_beam_retry_profile(self) -> None:
+        app = self._make_app()
+        which = subprocess.CompletedProcess(["which", "curl"], 0, "", "")
+        response = subprocess.CompletedProcess(
+            ["curl"], 0, '{"text":"recovered words"}', ""
+        )
+        with mock.patch(
+            "dictation.subprocess.run", side_effect=[which, response]
+        ) as run:
+            text = app._transcribe_server("/tmp/clip.wav", beam_size=5)
+        self.assertEqual(text, "recovered words")
+        cmd = run.call_args_list[1].args[0]
+        self.assertIn("beam_size=5", cmd)
+
+    def test_punctuation_only_retries_beam_on_same_server(self) -> None:
+        for punctuation in (",", "()", "[]", "/", "¿?", "。", "،"):
+            with self.subTest(punctuation=punctuation):
+                app = self._make_app()
+                app._transcribe_server = mock.Mock(
+                    side_effect=[punctuation, "recovered text"]
+                )
+                app._restart_whisper_server = mock.Mock()
+                with mock.patch.object(app, "_transcribe_cli") as cli:
+                    text = app._transcribe("/tmp/clip.wav")
+                self.assertEqual(text, "recovered text")
+                self.assertEqual(
+                    app._transcribe_server.call_args_list,
+                    [
+                        mock.call("/tmp/clip.wav"),
+                        mock.call("/tmp/clip.wav", beam_size=5),
+                    ],
+                )
+                app._restart_whisper_server.assert_not_called()
+                cli.assert_not_called()
+
+    def test_empty_server_text_retries_beam_on_same_server(self) -> None:
+        app = self._make_app()
+        app._transcribe_server = mock.Mock(side_effect=["", "recovered text"])
+        app._restart_whisper_server = mock.Mock()
+        with mock.patch.object(app, "_transcribe_cli") as cli:
+            text = app._transcribe("/tmp/clip.wav")
+        self.assertEqual(text, "recovered text")
+        self.assertEqual(
+            app._transcribe_server.call_args_list,
+            [mock.call("/tmp/clip.wav"), mock.call("/tmp/clip.wav", beam_size=5)],
+        )
+        app._restart_whisper_server.assert_not_called()
+        cli.assert_not_called()
+
+    def test_semantic_failure_restarts_then_retries_beam(self) -> None:
+        app = self._make_app()
+        app._transcribe_server = mock.Mock(side_effect=[",", ".", "recovered text"])
+        app._restart_whisper_server = mock.Mock(return_value=True)
+        with mock.patch.object(app, "_notify"):
+            with mock.patch.object(app, "_transcribe_cli") as cli:
+                text = app._transcribe("/tmp/clip.wav")
+        self.assertEqual(text, "recovered text")
+        self.assertEqual(
+            app._transcribe_server.call_args_list,
+            [
+                mock.call("/tmp/clip.wav"),
+                mock.call("/tmp/clip.wav", beam_size=5),
+                mock.call("/tmp/clip.wav", beam_size=5),
+            ],
+        )
+        app._restart_whisper_server.assert_called_once()
+        cli.assert_not_called()
+
+    def test_transport_then_semantic_failure_uses_beam_before_cpu(self) -> None:
+        app = self._make_app()
+        app._transcribe_server = mock.Mock(side_effect=[None, ",", "recovered text"])
+        app._restart_whisper_server = mock.Mock(return_value=True)
+        with mock.patch.object(app, "_notify"):
+            with mock.patch.object(app, "_transcribe_cli") as cli:
+                text = app._transcribe("/tmp/clip.wav")
+        self.assertEqual(text, "recovered text")
+        self.assertEqual(
+            app._transcribe_server.call_args_list,
+            [
+                mock.call("/tmp/clip.wav"),
+                mock.call("/tmp/clip.wav"),
+                mock.call("/tmp/clip.wav", beam_size=5),
+            ],
+        )
+        app._restart_whisper_server.assert_called_once()
+        cli.assert_not_called()
+
+    def test_exhausted_semantic_retries_fall_back_to_cpu(self) -> None:
+        app = self._make_app()
+        app._transcribe_server = mock.Mock(side_effect=[",", ".", "-"])
+        app._restart_whisper_server = mock.Mock(return_value=True)
+        cpu = Path("/tmp/cpu-whisper-cli")
+        with mock.patch.object(app, "_notify"):
+            with mock.patch.object(app, "_cpu_fallback_cli", return_value=cpu):
+                with mock.patch.object(
+                    app, "_transcribe_cli", return_value="cpu transcript"
+                ) as cli:
+                    text = app._transcribe("/tmp/clip.wav")
+        self.assertEqual(text, "cpu transcript")
+        self.assertEqual(app._transcribe_server.call_count, 3)
+        app._restart_whisper_server.assert_called_once()
+        cli.assert_called_once_with("/tmp/clip.wav", cli=cpu)
+
+    def test_valid_punctuation_containing_text_remains_fast_path(self) -> None:
+        app = self._make_app()
+        app._transcribe_server = mock.Mock(return_value="Wait, what?")
+        app._restart_whisper_server = mock.Mock()
+        with mock.patch.object(app, "_transcribe_cli") as cli:
+            text = app._transcribe("/tmp/clip.wav")
+        self.assertEqual(text, "Wait, what?")
+        app._transcribe_server.assert_called_once_with("/tmp/clip.wav")
+        app._restart_whisper_server.assert_not_called()
+        cli.assert_not_called()
+
+    def test_loud_punctuation_only_transcript_is_not_pasted(self) -> None:
+        from session_store import ChunkJob
+
+        handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        handle.write(b"\x00" * 2000)
+        handle.close()
+        job = ChunkJob(Path(handle.name).parent, 0, Path(handle.name), 8.0, True, 1)
+        try:
+            for punctuation in (",", "()", "[]", "/", "¿?", "。", "،"):
+                with self.subTest(punctuation=punctuation):
+                    app = self._make_app()
+                    app._store = mock.Mock()
+                    with mock.patch.object(
+                        app, "_transcribe", return_value=punctuation
+                    ):
+                        with mock.patch("dictation.wav_rms", return_value=400.0):
+                            with mock.patch.object(app, "_insert_chunk") as insert:
+                                with mock.patch.object(app, "_notify"):
+                                    app._deliver_chunk(job)
+                    insert.assert_not_called()
+                    app._store.terminal.assert_called_once()
+        finally:
+            os.unlink(handle.name)
+
+    def test_end_of_video_is_a_known_silence_hallucination(self) -> None:
+        from dictation import is_likely_hallucination
+
+        self.assertTrue(is_likely_hallucination("End of video."))
+
     def test_server_timeout_restarts_then_retries_without_gpu_cli(self) -> None:
         app = self._make_app()
         app._transcribe_server = mock.Mock(side_effect=[None, "recovered text"])
