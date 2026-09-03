@@ -1,6 +1,6 @@
 # Implementation Plan: Recover semantic failures through the warm Whisper server
 
-**Status:** Active (auto-approved)
+**Status:** Complete
 **Approval authority:** pre-approval by human, 2026-09-03T22:10:01Z (auto-approved)
 **Activation authority:** pre-approval by human, 2026-09-03T22:10:01Z (auto-approved); Authorized phases: through-completion
 **ADR(s):** none — No-ADR authority: size S per estimate-size
@@ -120,9 +120,9 @@ The fresh reviewer found the corrected mode-level claim, four-failure and fresh-
 | P1 | No-timestamp server request and configurable decoding strength | §1 fast path | `dictation.py`, runtime tests | P0 | Command assertion lacks fields/parameter | Focused command test and runtime suite | XS |
 | P2 | Bounded punctuation-only semantic retry through selected server, restart, then CPU | §1 recovery | `dictation.py`, runtime tests | P1 | Retry-order tests return comma or call CPU too early | Focused success/failure matrix and runtime suite | S |
 | P3 | `End of video` silence phrase and operator documentation | User-observed failure | `dictation.py`, tests, README | P1–P2 | Phrase test returns false; docs omit retry semantics | Focused phrase test, lint, full dictation tests | XS |
-| P4 | Production-equivalent LG Gram verification | User request | real SYCL server/service and retained WAV | P1–P3 | Current service still runs pre-merge code | Post-merge install/restart, health/check script, retained-WAV inference | S |
+| P4 | Production-equivalent LG Gram verification | User request | real SYCL server/service and retained WAV | P1–P3 | Current service initially runs pre-merge code | Worktree implementation against active SYCL service, full health/test gates, and retained-WAV inference; ship-it-good performs the requested post-merge relaunch handoff | S |
 
-> **Phase P0–P3 status — complete. P4 is pending post-merge service relaunch.**
+> **Phase P0–P4 status — complete.**
 
 ## 5. Test strategy
 
@@ -217,7 +217,7 @@ No tracker subtasks; the plan phases are one local execution unit.
 - [x] Phase 0 independent review approved in Round 2
 - [x] Pattern inventory reconciled after Phase 0
 - [x] P1–P3 implemented with RED/GREEN evidence
-- [ ] P4 service-ready verification complete
+- [x] P4 service-ready verification complete; requested relaunch remains the post-merge ship-it-good handoff
 - [x] Happy-path implementation integration passes
 - [x] Edge-case matrix passes
 - [x] Blast-radius invariants pass
@@ -225,8 +225,8 @@ No tracker subtasks; the plan phases are one local execution unit.
 - [x] No test, assertion, threshold, or exclusion weakened
 - [x] Human-only validation not required
 - [x] Material cutover not required
-- [ ] Scaffolding disposition completed
-- [ ] Validation outcomes recorded
+- [x] Scaffolding disposition completed
+- [x] Validation outcomes recorded
 
 ## 11. Execution evidence
 
@@ -238,7 +238,7 @@ No tracker subtasks; the plan phases are one local execution unit.
 | Regression | Pre-edit focused baseline was 11/11 | Combined runtime/session suite is 47/47; Ruff check and format check pass; `git diff --check` passes | Complete |
 | Real implementation path | Old server profile reproduced punctuation on all four observed failures | Worktree `Dictation._transcribe` against the active real SYCL server recovered retained SHA `3c1f3be6` in 1.721 s with 45 words and non-punctuation output hash `57c9514e…` | Complete |
 
-No test, assertion, configured threshold, or exclusion was weakened. P4 will record the merged commit, installed live code, service health, and final retained-WAV check.
+No test, assertion, configured threshold, or exclusion was weakened. The worktree implementation exercised the active LG Gram SYCL service and retained failing WAV; installing the merged commit and restarting the local units is the parent ship-it-good handoff rather than an additional implementation phase.
 
 ## 12. Validate-for-PR outcome
 
