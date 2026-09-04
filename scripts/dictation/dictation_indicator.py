@@ -28,6 +28,7 @@ LedState = Literal["idle", "on", "dim"]
 ICON_SIZE = 48
 TITLE_IDLE = "Whisper dictation - idle"
 TITLE_RECORDING = "Whisper dictation - recording"
+STARTUP_TIMEOUT_SEC = 0.5
 
 
 def tray_indicator_available() -> bool:
@@ -89,6 +90,10 @@ class TrayIndicator:
         self._lock = threading.Lock()
         self._icon: pystray.Icon | None = None
         self._thread: threading.Thread | None = None
+        self._blink_thread: threading.Thread | None = None
+        self._runner_error: OSError | None = None
+        self._runner_ready = threading.Event()
+        self._startup_complete = threading.Event()
         self._running = False
         self._last_led_state: LedState | None = None
 
@@ -102,9 +107,26 @@ class TrayIndicator:
                 icons["idle"],
                 TITLE_IDLE,
             )
-            self._icon.run_detached()
+            self._thread = threading.Thread(
+                target=self._run_icon,
+                name="whisper-dictation-tray-runner",
+                daemon=True,
+            )
+            self._runner_error = None
+            self._runner_ready.clear()
+            self._startup_complete.clear()
+            self._thread.start()
+            self._startup_complete.wait(timeout=STARTUP_TIMEOUT_SEC)
+            if (
+                not self._runner_ready.is_set()
+                or self._runner_error is not None
+                or not self._thread.is_alive()
+            ):
+                self._icon = None
+                return False
             self._last_led_state = "idle"
         except OSError as exc:
+            self._runner_error = exc
             print(
                 f"whisper-dictation: tray indicator failed ({exc})",
                 file=sys.stderr,
@@ -112,18 +134,58 @@ class TrayIndicator:
             self._icon = None
             return False
         self._running = True
-        self._thread = threading.Thread(
+        self._blink_thread = threading.Thread(
             target=self._tick_loop,
             name="whisper-dictation-tray",
             daemon=True,
         )
-        self._thread.start()
+        self._blink_thread.start()
         return True
 
-    def stop(self) -> None:
+    def _run_icon(self) -> None:
+        icon = self._icon
+        if icon is None:
+            return
+        try:
+            icon.run(setup=self._mark_ready)
+        except OSError as exc:
+            self._record_runner_error(exc)
+        finally:
+            self._startup_complete.set()
+
+    def _mark_ready(self, icon: pystray.Icon) -> None:
+        try:
+            icon.visible = True
+        except OSError as exc:
+            self._record_runner_error(exc)
+            return
+        self._runner_ready.set()
+        self._startup_complete.set()
+
+    def _record_runner_error(self, exc: OSError) -> None:
+        self._runner_error = exc
+        print(
+            f"whisper-dictation: tray indicator failed ({exc})",
+            file=sys.stderr,
+        )
+        self._startup_complete.set()
+
+    def stop(self, timeout: float = 0.5) -> None:
         self._running = False
-        if self._icon is not None:
-            self._icon.stop()
+        icon = self._icon
+        if icon is not None:
+            stopper = threading.Thread(
+                target=icon.stop,
+                name="whisper-dictation-tray-stopper",
+                daemon=True,
+            )
+            stopper.start()
+            started = time.monotonic()
+            stopper.join(timeout=max(0.0, timeout))
+            remaining = max(0.0, timeout - (time.monotonic() - started))
+            if self._thread is not None:
+                self._thread.join(timeout=remaining)
+        self._icon = None
 
     def set_recording(self, active: bool) -> None:
         with self._lock:

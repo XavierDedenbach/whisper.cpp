@@ -26,6 +26,14 @@ def write_wav(path: Path, frames: int = 1600) -> None:
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_completed_fragments_join_without_spacing_before_punctuation(self) -> None:
+        from session_store import join_fragments
+
+        self.assertEqual(
+            join_fragments(["  hello world  ", "again", ". Next", "   "]),
+            "hello world again. Next",
+        )
+
     def test_preserves_audio_and_rebuilds_ordered_transcript_after_failure(
         self,
     ) -> None:
@@ -57,6 +65,7 @@ class SessionStoreTests(unittest.TestCase):
                 (session / "transcript.txt").read_text(encoding="utf-8"),
                 "first words\n[corrupt: chunk 0001 — invalid WAV]\nlast words\n",
             )
+            self.assertEqual(store.completed_text(session), "first words last words")
             payload = json.loads((session / "manifest.json").read_text())
             self.assertEqual(
                 [item["status"] for item in payload["chunks"]],

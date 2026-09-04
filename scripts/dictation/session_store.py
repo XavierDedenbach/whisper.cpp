@@ -11,6 +11,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+_NO_SPACE_PREFIX = set(".,!?;:")
+
+
+def join_fragments(fragments: list[str]) -> str:
+    """Normalize and join Whisper fragments without separating punctuation."""
+    result = ""
+    for fragment in fragments:
+        fragment = " ".join(fragment.split())
+        if not fragment:
+            continue
+        if result and fragment[0] not in _NO_SPACE_PREFIX:
+            result += " "
+        result += fragment
+    return result
+
 
 @dataclass(frozen=True)
 class ChunkJob:
@@ -20,6 +35,7 @@ class ChunkJob:
     duration: float
     paste: bool = True
     paste_session: int = -1
+    finalize: bool = False
 
 
 class SessionStore:
@@ -52,6 +68,7 @@ class SessionStore:
         *,
         paste: bool = True,
         paste_session: int = -1,
+        finalize: bool = False,
     ) -> ChunkJob:
         destination = session / f"chunk-{chunk_index:04d}.wav"
         temporary = destination.with_suffix(".wav.partial")
@@ -88,6 +105,7 @@ class SessionStore:
             duration,
             paste,
             paste_session,
+            finalize,
         )
 
     def stop_session(self, session: Path | None) -> None:
@@ -187,6 +205,21 @@ class SessionStore:
             if len(jobs) >= limit:
                 break
         return jobs
+
+    def completed_text(self, session: Path) -> str:
+        """Return only successful fragments, assembled in manifest order."""
+        with self._lock:
+            manifest = self._load(session)
+            fragments: list[str] = []
+            for chunk in sorted(manifest["chunks"], key=lambda item: item["index"]):
+                if chunk["status"] != "complete":
+                    continue
+                fragment = session / f"chunk-{int(chunk['index']):04d}.txt"
+                if fragment.is_file():
+                    text = fragment.read_text(encoding="utf-8").strip()
+                    if text:
+                        fragments.append(text)
+            return join_fragments(fragments)
 
     def _change(self, job: ChunkJob, change: Callable[[dict[str, Any]], None]) -> None:
         with self._lock:

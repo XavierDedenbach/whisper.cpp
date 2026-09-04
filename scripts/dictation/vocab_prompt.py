@@ -147,17 +147,25 @@ def apply_replacements(text: str, replacements: list[tuple[str, str]]) -> str:
     return result
 
 
+def _as_prompt_prefix(raw: str) -> str:
+    """Keep the prefix unfinished; a trailing period can bias punctuation output."""
+    prefix = raw.strip()
+    if prefix.endswith("."):
+        return prefix[:-1].rstrip() + ":"
+    return prefix
+
+
 def build_whisper_prompt(cfg: dict[str, str] | None = None) -> str:
     """Compose initial prompt from prefix + vocabulary terms."""
     cfg = cfg or load_config()
     explicit = cfg.get("WHISPER_PROMPT", "").strip()
-    prefix = cfg.get("WHISPER_PROMPT_PREFIX", "Technical dictation.").strip()
+    prefix = _as_prompt_prefix(cfg.get("WHISPER_PROMPT_PREFIX", "Technical dictation:"))
     terms, _replacements = load_all_vocabulary(cfg)
     if terms:
-        return f"{prefix} Terms: {', '.join(terms)}."
+        return f"{prefix} {', '.join(terms)}"
     if explicit:
         return explicit
-    return prefix or "Technical dictation."
+    return prefix or "Technical dictation:"
 
 
 def main() -> None:
