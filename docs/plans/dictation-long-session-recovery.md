@@ -21,6 +21,11 @@
 **Context strategy:** dedicated worktree `/home/linu_x/Documents/git/whisper.cpp-worktrees/dictation-long-session-recovery`
 **Scope:** In: durable per-session WAV chunks, ordered transcript fragments/final transcript, per-chunk fault containment, restart recovery, graceful queue drain, configuration/docs/tests, and LG Gram relaunch. Out: model/backend changes, vocabulary/hallucination tuning already dirty in the live checkout, cloud storage, speaker diarization, audio editing, and automatic destructive retention.
 
+**Post-completion amendment:** `dictation-session-atomic-delivery.md` supersedes
+this plan's incremental live-paste behavior only. Persistence and recovery remain
+unchanged; live sessions now paste their ordered successful fragments once at
+stop.
+
 ## 1. Observable outcome and invariants
 
 ### End-to-end outcome
@@ -32,7 +37,7 @@ A 10–12 minute dictation can roll through approximately fourteen to sixteen 45
 - Session manifests are serialized under one process lock and committed with a same-directory temporary file, file `fsync`, `os.replace`, and parent-directory `fsync`; the last committed manifest is authoritative and orphan temporary files are ignored.
 - Chunk states are `recording`, `queued`, `transcribing`, `complete`, `no_text`, `silent`, `ignored`, `failed`, `corrupt`, `missing`, or `exhausted`. `complete`, `silent`, `ignored`, `missing`, and `exhausted` are terminal.
 - On startup, queued, interrupted, and retryable failed chunks are discovered and requeued. Missing audio becomes `missing`; repeated failures retain an explicit marker and the original audio for manual recovery.
-- Recovery is capped at 32 chunks per daemon start. Recovered work never invokes interactive paste; a subsequent live recording retains normal paste behavior. Priority scheduling beyond the existing FIFO is deferred under R-1.
+- Recovery is capped at 32 chunks per daemon start. Recovered work never invokes interactive paste; a subsequent live recording pastes its assembled successful fragments once after finalization. Priority scheduling beyond the existing FIFO is deferred under R-1.
 - SIGTERM stops/finalizes the active recorder, marks the session stopped, and waits at most five seconds for ready queue work. In-flight work remains recoverable. The systemd unit grants a 15-second stop bound; process-faithful stress simulation is deferred under R-3.
 - Session audio is retained by default. This plan performs no automatic destructive retention; operators may delete completed session directories after verifying `transcript.txt`.
 
@@ -41,7 +46,7 @@ A 10–12 minute dictation can roll through approximately fourteen to sixteen 45
 | Affected contract | Existing behavior | Characterization test | Allowed change |
 |---|---|---|---|
 | Recording continuity | At `MAX_RECORD_SEC`, the next recorder starts before the old one stops | Existing roll-order test plus a 16-chunk state-machine test | Preserve continuous rolling; persistence must not introduce a capture gap |
-| Interactive paste | Successful live chunks paste in sequence | Existing prefix/order tests | Continue incremental paste for live chunks; recovered historical chunks never paste |
+| Interactive paste | Successful live chunks are assembled in sequence | Session-atomic delivery tests | Paste once after finalization; recovered historical chunks never paste |
 | Accelerator selection | CPU, CUDA, and SYCL use the same daemon | Existing runtime integration suite and live health check | No backend/build selection change |
 | Server recovery | Server restart/retry and CPU fallback are bounded | Existing hang-recovery tests | A failed inference becomes a durable chunk failure rather than deleted audio |
 | Local-only privacy | Audio currently remains local | Filesystem tests inspect paths/modes | Sessions remain local; no network destination beyond loopback whisper-server |

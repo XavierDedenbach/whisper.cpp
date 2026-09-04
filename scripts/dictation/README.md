@@ -34,9 +34,14 @@ bash scripts/dictation/check.sh
 
 ### 4. Use
 
-Focus any text field → **Ctrl+Space** → speak → **Ctrl+Space** → text is pasted.
+Focus any text field → **Ctrl+Space** → speak → **Ctrl+Space** → the complete
+recording is pasted once.
 
-Keep talking past 45 seconds: the first slice pastes while the next slice is already recording. Press Ctrl+Space when you are done; the last partial slice pastes after that.
+Keep talking past 45 seconds: completed slices are transcribed in the background
+while the next slice records. Press Ctrl+Space when you are done; after the last
+partial slice finishes, all successful slices are assembled in order and sent in
+one clipboard paste. This prevents a changing application window from dropping
+middle slices between incremental pastes.
 
 Each finalized slice is also retained under
 `~/.local/share/whisper-dictation/sessions/<session>/`. A failure in one slice
@@ -249,18 +254,18 @@ File: `~/.config/whisper-dictation/config.env` (created on first install)
 | `WHISPER_SERVER_TIMEOUT` | `90` | Client `/inference` curl budget in seconds |
 | `WHISPER_INFERENCE_WATCHDOG_SEC` | `90` | Kill and restart the server if an inference socket stays open this long (`0` disables) |
 | `WHISPER_SERVER_RECYCLE_SEC` | `21600` | Recycle a healthy idle server this often (6h) to shed Intel GPU hangs |
-| `MAX_RECORD_SEC` | `45` | Slice length. Auto-rolls into the next recording so long speech keeps landing in 45s pastes (`0` = unlimited single take) |
+| `MAX_RECORD_SEC` | `45` | Slice length. Auto-rolls and transcribes online, then pastes the assembled session once at stop (`0` = unlimited single take) |
 | `WHISPER_SESSION_DIR` | `~/.local/share/whisper-dictation/sessions` | Durable retained WAV chunks, recovery manifest, and `transcript.txt` for each recording session |
 | `WHISPER_LANGUAGE` | `en` | Language id |
 | `WHISPER_SUPPRESS_NST` | `1` | Suppress non-speech tokens |
-| `WHISPER_PROMPT_PREFIX` | `Technical dictation.` | Prefix for the vocabulary prompt |
+| `WHISPER_PROMPT_PREFIX` | `Technical dictation:` | Unfinished cue before vocabulary terms; avoid a trailing period, which can bias punctuation-only output |
 | `WHISPER_VOCABULARY_FILE` | `~/.config/whisper-dictation/vocabulary.txt` | Optional machine-local overlay (shared terms are in-repo) |
 | `WHISPER_PROMPT` | (see config.env) | Fallback prompt if no vocabulary file exists |
 | `WHISPER_THREADS` | `4` | CPU threads |
 | `HOTKEY_MODIFIERS` | `ctrl` | `alt`, `shift`, `ctrl`, `super` |
 | `HOTKEY_KEY` | `space` | Trigger key |
 | `AUDIO_SOURCE` | empty (system default) | PulseAudio source — list with `pactl list sources short` |
-| `INSERT_METHOD` | `clipboard` | `clipboard` or `type` |
+| `INSERT_METHOD` | `clipboard` | Compatibility setting; delivery always uses one clipboard paste because timed direct typing can leave a partial transcript |
 
 Example — set a specific USB mic:
 
@@ -283,7 +288,7 @@ systemctl --user restart whisper-dictation
 | Text pasted twice | Two daemons running — `rm ~/.config/autostart/whisper-dictation.desktop` then `systemctl --user restart whisper-dictation` |
 | Server fallback | Check `systemctl --user status whisper-dictation-server` |
 | Recording LED works but no text | SYCL server hung — `/health` still returns ok. `systemctl --user restart whisper-dictation-server`. A watchdog now kills stuck inferences automatically. |
-| A long recording lost one slice | Open the newest directory under `~/.local/share/whisper-dictation/sessions`; usable slices remain as numbered WAVs and `transcript.txt` marks the failed position |
+| A long recording did not paste | Open the newest directory under `~/.local/share/whisper-dictation/sessions`; usable slices remain as numbered WAVs and `transcript.txt` marks any failed position. The journal logs either `paste-dispatched` or `paste-failed` with that session path |
 | First GPU request is slow | Keep `WHISPER_SERVER_WARMUP=1`; wait for the server unit to become `active` before dictating |
 | CUDA backend missing | Run `nvidia-smi`, confirm `nvcc` is installed, rebuild with `build-cuda.sh`, then run `check.sh` |
 | SYCL device missing | Source oneAPI and run `ONEAPI_DEVICE_SELECTOR=level_zero:gpu sycl-ls` |

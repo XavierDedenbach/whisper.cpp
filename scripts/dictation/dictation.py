@@ -3,7 +3,8 @@
 
 Toggle mode (default): Ctrl+Space to start, Ctrl+Space again to stop.
 Long utterances are sliced every MAX_RECORD_SEC: the filled slice is
-transcribed and pasted while the next slice is already recording.
+transcribed while the next slice is already recording. The complete ordered
+session is pasted once when recording stops.
 Uses scripts/dictation/.venv if present (created by install.sh).
 """
 
@@ -24,6 +25,7 @@ import threading
 import time
 import unicodedata
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 
 _venv = Path(__file__).resolve().parent / ".venv" / "lib"
@@ -59,22 +61,39 @@ MODIFIER_KEYS = {
 # notify-send -r requires an integer replace id (a string is ignored / errors).
 NOTIFY_REPLACE_ID = "4242"
 SERVER_UNIT = "whisper-dictation-server.service"
-_CHUNK_NO_SPACE_PREFIX = set(".,!?;:")
 MIN_USABLE_WAV_BYTES = 1000
 RECORDER_START_ATTEMPTS = 3
 RECORDER_START_TIMEOUT_SEC = 1.0
 RECORDER_RETRY_DELAY_SEC = 0.05
 RECORDER_WATCH_POLL_SEC = 0.05
+SHUTDOWN_BUDGET_SEC = 13.0
+SHUTDOWN_RESOURCE_RESERVE_SEC = 1.0
+CLIPBOARD_READY_TIMEOUT_SEC = 0.5
+CLIPBOARD_TERM_TIMEOUT_SEC = 0.25
+CLIPBOARD_KILL_TIMEOUT_SEC = 0.25
+XDOTOOL_TIMEOUT_SEC = 0.25
+TRAY_STOP_TIMEOUT_SEC = 0.5
+MAX_RECORDER_FLUSH_MSEC = 500.0
 
 
-def prefix_chunk_for_insert(need_space: bool, chunk: str) -> tuple[str, bool]:
-    """Return (text to paste, whether the next chunk needs a leading space)."""
-    chunk = " ".join(chunk.split())
-    if not chunk:
-        return "", need_space
-    if need_space and chunk[0] not in _CHUNK_NO_SPACE_PREFIX:
-        chunk = " " + chunk
-    return chunk, True
+@dataclass(frozen=True)
+class SessionPasteJob:
+    """Paste all completed fragments after the final live chunk is processed."""
+
+    session_path: Path
+    session_id: int
+
+
+def remaining_timeout(
+    deadline: float | None,
+    maximum: float,
+    *,
+    reserve: float = 0.0,
+) -> float:
+    """Return a non-negative wait bounded by an optional absolute deadline."""
+    if deadline is None:
+        return maximum
+    return max(0.0, min(maximum, deadline - time.monotonic() - reserve))
 
 
 def build_notify_cmd(title: str, msg: str, dwell_ms: int) -> list[str]:
@@ -129,14 +148,19 @@ def build_recorder_cmd(
     return None
 
 
-def wait_for_wav_stable(path: str, timeout: float = 1.0) -> None:
+def wait_for_wav_stable(
+    path: str,
+    timeout: float = 1.0,
+    *,
+    deadline: float | None = None,
+) -> None:
     """Wait until WAV file size stops growing (recorder flushed to disk)."""
     if not path or not os.path.exists(path):
         return
-    deadline = time.monotonic() + timeout
+    stable_deadline = time.monotonic() + remaining_timeout(deadline, timeout)
     last_size = -1
     stable_since: float | None = None
-    while time.monotonic() < deadline:
+    while time.monotonic() < stable_deadline:
         size = os.path.getsize(path)
         if size == last_size:
             if stable_since is None:
@@ -154,14 +178,17 @@ def graceful_stop_recorder(
     wav_path: str | None,
     flush_msec: float,
     wait_timeout: float = 5.0,
-) -> None:
-    """Keep recording briefly to capture buffered tail audio, then finalize WAV."""
+    *,
+    deadline: float | None = None,
+) -> bool:
+    """Finalize the WAV and report whether the recorder child was reaped."""
+    flush_msec = min(max(0.0, flush_msec), MAX_RECORDER_FLUSH_MSEC)
     if flush_msec > 0 and proc and proc.poll() is None:
-        time.sleep(flush_msec / 1000.0)
-    if not proc or proc.poll() is not None:
+        time.sleep(remaining_timeout(deadline, flush_msec / 1000.0, reserve=0.25))
+    if proc is None or proc.poll() is not None:
         if wav_path:
-            wait_for_wav_stable(wav_path)
-        return
+            wait_for_wav_stable(wav_path, deadline=deadline)
+        return True
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGINT)
     except ProcessLookupError:
@@ -170,15 +197,26 @@ def graceful_stop_recorder(
         except ProcessLookupError:
             pass
     try:
-        proc.wait(timeout=wait_timeout)
+        proc.wait(timeout=remaining_timeout(deadline, wait_timeout, reserve=0.25))
     except subprocess.TimeoutExpired:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except ProcessLookupError:
-            proc.kill()
-        proc.wait(timeout=2)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            proc.wait(timeout=remaining_timeout(deadline, 0.25))
+        except subprocess.TimeoutExpired:
+            print(
+                f"whisper-dictation: recorder {proc.pid} did not reap before shutdown deadline",
+                file=sys.stderr,
+            )
+            return False
     if wav_path:
-        wait_for_wav_stable(wav_path)
+        wait_for_wav_stable(wav_path, deadline=deadline)
+    return True
 
 
 def wake_audio_source(source: str) -> None:
@@ -364,7 +402,13 @@ class Dictation:
         self.recorder_stop_flush_msec = float(
             cfg.get("RECORDER_STOP_FLUSH_MSEC", "120")
         )
-        self.insert_method = cfg.get("INSERT_METHOD", "clipboard")
+        configured_insert_method = cfg.get("INSERT_METHOD", "clipboard").strip().lower()
+        if configured_insert_method not in {"", "clipboard"}:
+            print(
+                "whisper-dictation: direct typing is no longer used; "
+                "INSERT_METHOD now uses atomic clipboard paste",
+                file=sys.stderr,
+            )
         self.mod_groups = parse_modifiers(cfg.get("HOTKEY_MODIFIERS", "ctrl"))
         self.trigger_key = resolve_trigger_key(cfg.get("HOTKEY_KEY", "space"))
         self.hotkey_mode = cfg.get("HOTKEY_MODE", "toggle").strip().lower()
@@ -399,7 +443,14 @@ class Dictation:
         self._session_start = 0.0
         self._record_generation = 0
         self._last_recorder_error = ""
+        self._rejected_recorder_lock = threading.Lock()
+        self._unreaped_rejected_recorders = 0
         self._lock = threading.Lock()
+        self._finalize_lock = threading.Lock()
+        self._shutdown_deadline: float | None = None
+        self._clipboard_lock = threading.Lock()
+        self._clipboard_proc: subprocess.Popen | None = None
+        self._clipboard_closed = threading.Event()
         self._max_timer: threading.Timer | None = None
         self._recorder = build_recorder_cmd(self.audio_source, cfg)
         self._hotkey_chord_active = False  # ignore Space key-repeat until release
@@ -412,13 +463,13 @@ class Dictation:
         self._tray = TrayIndicator(blink_interval_s=blink_s)
         self._chunk_seq = 0
         self._next_submit = 0
-        self._staged: dict[int, ChunkJob | None] = {}
-        self._chunk_queue: queue.Queue[ChunkJob | None] = queue.Queue()
+        self._staged: dict[int, ChunkJob | SessionPasteJob | None] = {}
+        self._chunk_queue: queue.Queue[ChunkJob | SessionPasteJob | None] = (
+            queue.Queue()
+        )
         self._session_id = 0
         self._session_paths: dict[int, Path] = {}
         self._active_session: Path | None = None
-        self._paste_session = -1
-        self._chunk_needs_space = False
         for job in self._store.recoverable(limit=32):
             self._chunk_queue.put(job)
         self._worker = threading.Thread(
@@ -541,25 +592,73 @@ class Dictation:
 
     def _wait_for_recorder_ready(
         self, proc: subprocess.Popen, path: str
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, bool]:
+        """Return readiness, detail, and whether a rejected child is reaped."""
         deadline = time.monotonic() + RECORDER_START_TIMEOUT_SEC
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                return False, self._recorder_exit_detail(proc)
+                return False, self._recorder_exit_detail(proc), True
             try:
                 if os.path.getsize(path) >= MIN_USABLE_WAV_BYTES:
-                    return True, ""
+                    return True, "", False
             except FileNotFoundError:
                 pass
             time.sleep(0.01)
 
         if proc.poll() is None:
-            graceful_stop_recorder(proc, path, 0, wait_timeout=0.5)
+            reaped = graceful_stop_recorder(proc, path, 0, wait_timeout=0.5)
+            if not reaped:
+                return (
+                    False,
+                    f"no audio payload within {RECORDER_START_TIMEOUT_SEC:.2f}s "
+                    "(recorder did not reap)",
+                    False,
+                )
         detail = self._recorder_exit_detail(proc)
         return (
             False,
             f"no audio payload within {RECORDER_START_TIMEOUT_SEC:.2f}s ({detail})",
+            True,
         )
+
+    @staticmethod
+    def _reap_rejected_recorder(proc: subprocess.Popen, path: str) -> None:
+        """Retain an unreaped startup child and its WAV until wait completes."""
+        try:
+            proc.wait()
+        except (ChildProcessError, OSError):
+            return
+        stream = getattr(proc, "stderr", None)
+        if stream is not None:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    def _retain_rejected_recorder(self, proc: subprocess.Popen, path: str) -> None:
+        with self._rejected_recorder_lock:
+            self._unreaped_rejected_recorders += 1
+
+        def reap() -> None:
+            try:
+                self._reap_rejected_recorder(proc, path)
+            finally:
+                with self._rejected_recorder_lock:
+                    self._unreaped_rejected_recorders -= 1
+
+        threading.Thread(
+            target=reap,
+            name=f"whisper-recorder-reaper-{proc.pid}",
+            daemon=True,
+        ).start()
+
+    def _rejected_recorder_pending(self) -> bool:
+        with self._rejected_recorder_lock:
+            return self._unreaped_rejected_recorders > 0
 
     def _spawn_recorder(self) -> tuple[subprocess.Popen, str] | None:
         """Start and validate a recorder, retrying bounded startup failures."""
@@ -583,7 +682,7 @@ class Dictation:
                 os.unlink(path)
                 break
 
-            ready, detail = self._wait_for_recorder_ready(proc, path)
+            ready, detail, reaped = self._wait_for_recorder_ready(proc, path)
             if ready:
                 if attempt > 1:
                     print(
@@ -598,21 +697,28 @@ class Dictation:
                 f"{RECORDER_START_ATTEMPTS} failed: {detail}",
                 file=sys.stderr,
             )
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+            if reaped:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            else:
+                self._retain_rejected_recorder(proc, path)
+                break
             if attempt < RECORDER_START_ATTEMPTS and RECORDER_RETRY_DELAY_SEC > 0:
                 time.sleep(RECORDER_RETRY_DELAY_SEC)
         return None
 
     def _stage_chunk(
-        self, wav: str | None, duration: float, seq: int, session_id: int
+        self,
+        wav: str | None,
+        duration: float,
+        seq: int,
+        session_id: int,
+        *,
+        finalize: bool = False,
     ) -> None:
         """Finalize-order gate: chunks enter the worker FIFO in seq order."""
-        if not wav:
-            self._submit_in_order(seq, None)
-            return
         session = self._session_paths.get(session_id)
         if session is None:
             print(
@@ -620,6 +726,10 @@ class Dictation:
                 file=sys.stderr,
             )
             self._submit_in_order(seq, None)
+            return
+        if not wav:
+            marker = SessionPasteJob(session, session_id) if finalize else None
+            self._submit_in_order(seq, marker)
             return
         try:
             job = self._store.ingest(
@@ -629,6 +739,7 @@ class Dictation:
                 duration,
                 paste=True,
                 paste_session=session_id,
+                finalize=finalize,
             )
         except Exception as exc:
             print(
@@ -642,12 +753,15 @@ class Dictation:
                     f"whisper-dictation: could not record chunk {seq} gap: {marker_exc}",
                     file=sys.stderr,
                 )
-            self._submit_in_order(seq, None)
+            marker = SessionPasteJob(session, session_id) if finalize else None
+            self._submit_in_order(seq, marker)
             return
 
         self._submit_in_order(seq, job)
 
-    def _submit_in_order(self, seq: int, job: ChunkJob | None) -> None:
+    def _submit_in_order(
+        self, seq: int, job: ChunkJob | SessionPasteJob | None
+    ) -> None:
         with self._lock:
             self._staged[seq] = job
             while self._next_submit in self._staged:
@@ -662,6 +776,11 @@ class Dictation:
             try:
                 if item is None:
                     return
+                if isinstance(item, SessionPasteJob):
+                    self._deliver_completed_session_safely(
+                        item.session_path, item.session_id
+                    )
+                    continue
                 try:
                     self._deliver_chunk(item)
                 except Exception as exc:
@@ -676,19 +795,54 @@ class Dictation:
                             f"whisper-dictation: could not record chunk failure: {store_exc}",
                             file=sys.stderr,
                         )
+                finally:
+                    if item.finalize:
+                        self._deliver_completed_session_safely(
+                            item.session_path, item.paste_session
+                        )
             finally:
                 self._chunk_queue.task_done()
 
-    def _insert_chunk(self, text: str, session_id: int) -> str:
-        if session_id != self._paste_session:
-            self._paste_session = session_id
-            self._chunk_needs_space = False
-        pasted, self._chunk_needs_space = prefix_chunk_for_insert(
-            self._chunk_needs_space, text
+    def _deliver_completed_session(self, session: Path, session_id: int) -> None:
+        """Dispatch a live session once, after every preceding chunk is terminal."""
+        text = self._store.completed_text(session)
+        transcript = session / "transcript.txt"
+        if not text:
+            print(
+                f"whisper-dictation: session={session.name} has no completed text; "
+                f"saved={transcript}",
+                file=sys.stderr,
+            )
+            self._notify(f"No usable speech — session saved at {transcript}")
+            return
+
+        if not self._insert(text):
+            print(
+                f"whisper-dictation: paste-failed session={session.name} "
+                f"chars={len(text)} saved={transcript}",
+                file=sys.stderr,
+            )
+            self._notify(f"Paste failed — transcript saved at {transcript}")
+            return
+
+        print(
+            f"whisper-dictation: paste-dispatched session={session.name} "
+            f"session_id={session_id} chars={len(text)}",
+            file=sys.stderr,
         )
-        if pasted:
-            self._insert(pasted)
-        return pasted
+        preview = text if len(text) <= 60 else text[:57] + "…"
+        self._notify(f"Typed: {preview}")
+
+    def _deliver_completed_session_safely(self, session: Path, session_id: int) -> None:
+        try:
+            self._deliver_completed_session(session, session_id)
+        except Exception as exc:
+            print(
+                f"whisper-dictation: session paste failed unexpectedly: {exc}; "
+                f"saved={session / 'transcript.txt'}",
+                file=sys.stderr,
+            )
+            self._notify(f"Paste failed — transcript saved at {session}")
 
     def _activate_recorder_locked(self, spawned: tuple[subprocess.Popen, str]) -> int:
         self._record_proc, self._wav_path = spawned
@@ -728,17 +882,37 @@ class Dictation:
         detail: str,
     ) -> None:
         """Replace a recorder only when it is still the active generation."""
+        deadline = self._finalization_deadline(None)
+        if not self._acquire_finalize_lock(deadline):
+            print(
+                "whisper-dictation: recorder recovery skipped at shutdown deadline",
+                file=sys.stderr,
+            )
+            return
+        try:
+            self._handle_recorder_exit_locked(proc, wav, generation, detail)
+        finally:
+            self._finalize_lock.release()
+
+    def _handle_recorder_exit_locked(
+        self,
+        proc: subprocess.Popen,
+        wav: str,
+        generation: int,
+        detail: str,
+    ) -> None:
         watch: tuple[subprocess.Popen, str, int] | None = None
         session: Path | None = None
+        continue_recording = False
         with self._lock:
             if (
-                not self._recording
-                or self._record_proc is not proc
+                self._record_proc is not proc
                 or self._wav_path != wav
                 or self._record_generation != generation
             ):
                 return
 
+            continue_recording = self._recording and self._shutdown_deadline is None
             duration = time.monotonic() - self._record_start
             seq = self._chunk_seq
             self._chunk_seq += 1
@@ -747,27 +921,37 @@ class Dictation:
             self._record_proc = None
             self._wav_path = None
             self._cancel_max_timer()
+            if self._recording and not continue_recording:
+                self._recording = False
+                self._tray.set_recording(False)
+            action = "reconnecting" if continue_recording else "finalizing"
             print(
                 f"whisper-dictation: recorder exited during chunk {seq} "
-                f"after {duration:.2f}s ({detail}); reconnecting",
+                f"after {duration:.2f}s ({detail}); {action}",
                 file=sys.stderr,
             )
 
-            spawned = self._spawn_recorder()
-            if spawned is None:
-                self._recording = False
-                self._tray.set_recording(False)
-            else:
-                next_generation = self._activate_recorder_locked(spawned)
-                watch = (*spawned, next_generation)
+            if continue_recording:
+                spawned = self._spawn_recorder()
+                if spawned is None:
+                    self._recording = False
+                    self._tray.set_recording(False)
+                else:
+                    next_generation = self._activate_recorder_locked(spawned)
+                    watch = (*spawned, next_generation)
 
         if watch is not None:
             self._start_recorder_watch(*watch)
-        self._stage_chunk(wav, duration, seq, session_id)
+        if watch is None:
+            self._stage_chunk(wav, duration, seq, session_id, finalize=True)
+        else:
+            self._stage_chunk(wav, duration, seq, session_id)
         if watch is not None:
             return
 
         self._store.stop_session(session)
+        if not continue_recording:
+            return
         reason = self._last_recorder_error or detail
         self._notify(f"Recorder unavailable — saved prior audio ({reason[:80]})")
 
@@ -776,7 +960,12 @@ class Dictation:
         hold = False
         watch: tuple[subprocess.Popen, str, int] | None = None
         with self._lock:
-            if self._recording:
+            if (
+                self._shutdown_deadline is not None
+                or self._recording
+                or self._record_proc is not None
+                or self._rejected_recorder_pending()
+            ):
                 return
             if not self.cli.is_file():
                 self._notify(
@@ -810,27 +999,85 @@ class Dictation:
         if started:
             self._notify("Listening…" if hold else "Recording… (Ctrl+Space to stop)")
 
-    def _roll_recording(self, expected_generation: int | None = None) -> None:
+    def _finalization_deadline(self, deadline: float | None) -> float:
+        own_deadline = (
+            time.monotonic() + SHUTDOWN_BUDGET_SEC - SHUTDOWN_RESOURCE_RESERVE_SEC
+        )
+        if deadline is not None:
+            own_deadline = min(own_deadline, deadline)
+        if self._shutdown_deadline is not None:
+            own_deadline = min(
+                own_deadline,
+                self._shutdown_deadline - SHUTDOWN_RESOURCE_RESERVE_SEC,
+            )
+        return own_deadline
+
+    def _acquire_finalize_lock(self, deadline: float) -> bool:
+        return self._finalize_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        )
+
+    def _roll_recording(
+        self,
+        expected_generation: int | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         """Release the filled recorder, then acquire and validate its successor."""
+        deadline = self._finalization_deadline(deadline)
+        if not self._acquire_finalize_lock(deadline):
+            print(
+                "whisper-dictation: recording roll skipped at shutdown deadline",
+                file=sys.stderr,
+            )
+            return
+        try:
+            self._roll_recording_locked(
+                expected_generation=expected_generation,
+                deadline=deadline,
+            )
+        finally:
+            self._finalize_lock.release()
+
+    def _roll_recording_locked(
+        self,
+        expected_generation: int | None,
+        *,
+        deadline: float,
+    ) -> None:
         watch: tuple[subprocess.Popen, str, int] | None = None
         session: Path | None = None
         with self._lock:
-            if not self._recording or (
-                expected_generation is not None
-                and expected_generation != self._record_generation
+            if (
+                self._shutdown_deadline is not None
+                or not self._recording
+                or (
+                    expected_generation is not None
+                    and expected_generation != self._record_generation
+                )
             ):
                 return
             old_proc = self._record_proc
             old_wav = self._wav_path
             duration = time.monotonic() - self._record_start
             seq = self._chunk_seq
-            self._chunk_seq += 1
             session_id = self._session_id
             session = self._session_paths.get(session_id)
+            self._cancel_max_timer()
+            if not graceful_stop_recorder(
+                old_proc,
+                old_wav,
+                0,
+                deadline=deadline,
+            ):
+                print(
+                    "whisper-dictation: recorder rollover retained until child exits",
+                    file=sys.stderr,
+                )
+                return
+            self._chunk_seq += 1
             self._record_proc = None
             self._wav_path = None
-            self._cancel_max_timer()
-            graceful_stop_recorder(old_proc, old_wav, 0)
             spawned = self._spawn_recorder()
             if spawned is None:
                 self._recording = False
@@ -841,7 +1088,10 @@ class Dictation:
 
         if watch is not None:
             self._start_recorder_watch(*watch)
-        self._stage_chunk(old_wav, duration, seq, session_id)
+        if watch is None:
+            self._stage_chunk(old_wav, duration, seq, session_id, finalize=True)
+        else:
+            self._stage_chunk(old_wav, duration, seq, session_id)
         if watch is not None:
             return
 
@@ -849,23 +1099,55 @@ class Dictation:
         reason = self._last_recorder_error or "recorder start failed"
         self._notify(f"Recorder unavailable — saved prior audio ({reason[:80]})")
 
-    def _finish_recording(self) -> None:
+    def _finish_recording(self, *, deadline: float | None = None) -> None:
+        deadline = self._finalization_deadline(deadline)
+        if not self._acquire_finalize_lock(deadline):
+            print(
+                "whisper-dictation: recording finalizer exceeded shutdown deadline",
+                file=sys.stderr,
+            )
+            return
+        try:
+            self._finish_recording_locked(deadline=deadline)
+        finally:
+            self._finalize_lock.release()
+
+    def _finish_recording_locked(self, *, deadline: float | None = None) -> None:
         with self._lock:
-            if not self._recording:
+            if not self._recording and self._record_proc is None:
                 return
-            self._recording = False
-            self._cancel_max_timer()
-            self._tray.set_recording(False)
+            if self._recording:
+                self._recording = False
+                self._cancel_max_timer()
+                self._tray.set_recording(False)
             proc = self._record_proc
             wav = self._wav_path
+            generation = self._record_generation
             duration = time.monotonic() - self._record_start
             seq = self._chunk_seq
-            self._chunk_seq += 1
             session_id = self._session_id
+        if not graceful_stop_recorder(
+            proc,
+            wav,
+            self.recorder_stop_flush_msec,
+            deadline=deadline,
+        ):
+            print(
+                "whisper-dictation: recorder finalization retained until child exits",
+                file=sys.stderr,
+            )
+            return
+        with self._lock:
+            if (
+                self._record_proc is not proc
+                or self._wav_path != wav
+                or self._record_generation != generation
+            ):
+                return
             self._record_proc = None
             self._wav_path = None
-        graceful_stop_recorder(proc, wav, self.recorder_stop_flush_msec)
-        self._stage_chunk(wav, duration, seq, session_id)
+            self._chunk_seq += 1
+        self._stage_chunk(wav, duration, seq, session_id, finalize=True)
         self._store.stop_session(self._session_paths.get(session_id))
 
     def _deliver_chunk(self, job: ChunkJob) -> None:
@@ -914,6 +1196,11 @@ class Dictation:
             self._store.fail(job, detail=str(exc))
             return
 
+        print(
+            f"whisper-dictation: chunk={job.chunk_index} transcript_chars={len(text)} "
+            f"rms={rms:.0f} duration={duration:.1f}s",
+            file=sys.stderr,
+        )
         if not text:
             self._store.terminal(job, "no_text", "transcription returned no text")
             if not listening:
@@ -923,6 +1210,8 @@ class Dictation:
                 )
             return
 
+        # Punctuation-only is never real dictation. Phrase hallucinations like
+        # "thank you" are only dropped on quiet clips so spoken "bye" still works.
         if is_punctuation_only(text) or (
             is_likely_hallucination(text) and rms < self.min_audio_rms * 2
         ):
@@ -934,27 +1223,34 @@ class Dictation:
             return
 
         self._store.complete(job, text)
-        if not job.paste:
-            return
-        pasted = self._insert_chunk(text, session_id)
-        preview = pasted.strip()
-        if len(preview) > 60:
-            preview = preview[:57] + "…"
         listening = self._recording and session_id == self._session_id
-        if listening:
-            self._notify(f"Typed: {preview} (still listening…)")
-        else:
-            self._notify(f"Typed: {preview}")
+        if job.paste and listening:
+            self._notify(f"Transcribed chunk {job.chunk_index + 1} (still listening…)")
 
     def shutdown(self, drain_seconds: float = 5.0) -> None:
         """Finalize active audio and leave queued work recoverable for next start."""
-        if self._recording:
-            self._finish_recording()
-        else:
+        shutdown_deadline = time.monotonic() + SHUTDOWN_BUDGET_SEC
+        with self._lock:
+            if self._shutdown_deadline is None:
+                self._shutdown_deadline = shutdown_deadline
+            else:
+                shutdown_deadline = self._shutdown_deadline
+        work_deadline = shutdown_deadline - SHUTDOWN_RESOURCE_RESERVE_SEC
+        try:
+            # Calling unconditionally also waits for a hotkey finalizer that already
+            # cleared _recording but still owns the recorder/WAV handoff.
+            self._finish_recording(deadline=work_deadline)
             self._store.stop_session(self._active_session)
-        deadline = time.monotonic() + drain_seconds
-        while self._chunk_queue.unfinished_tasks and time.monotonic() < deadline:
-            time.sleep(0.05)
+            drain_deadline = min(time.monotonic() + drain_seconds, work_deadline)
+            while (
+                self._chunk_queue.unfinished_tasks and time.monotonic() < drain_deadline
+            ):
+                time.sleep(0.05)
+        finally:
+            self._stop_clipboard_owner(deadline=shutdown_deadline)
+            self._tray.stop(
+                timeout=remaining_timeout(shutdown_deadline, TRAY_STOP_TIMEOUT_SEC)
+            )
 
     def _cpu_fallback_cli(self) -> Path | None:
         """CPU whisper-cli from the portable build/, if it is not the active GPU binary."""
@@ -1164,25 +1460,119 @@ class Dictation:
             text = str(payload.get("text", "")).strip()
         return " ".join(text.split())
 
-    def _insert(self, text: str) -> None:
-        use_clipboard = (
-            self.insert_method == "clipboard"
-            and subprocess.run(["which", "xclip"], capture_output=True).returncode == 0
-        )
-        if use_clipboard:
-            subprocess.run(
-                ["xclip", "-selection", "clipboard"],
-                input=text.encode("utf-8"),
-                check=False,
-            )
-            subprocess.run(
-                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-                check=False,
-            )
+    @staticmethod
+    def _terminate_clipboard_process(
+        proc: subprocess.Popen,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        if proc.poll() is not None:
             return
-        subprocess.run(
-            ["xdotool", "type", "--clearmodifiers", "--delay", "12", "--", text],
-            check=False,
+        proc.terminate()
+        try:
+            proc.wait(timeout=remaining_timeout(deadline, CLIPBOARD_TERM_TIMEOUT_SEC))
+            return
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        try:
+            proc.wait(timeout=remaining_timeout(deadline, CLIPBOARD_KILL_TIMEOUT_SEC))
+        except subprocess.TimeoutExpired:
+            print(
+                f"whisper-dictation: xclip {proc.pid} did not reap before shutdown deadline",
+                file=sys.stderr,
+            )
+
+    def _stop_clipboard_owner(self, *, deadline: float | None = None) -> None:
+        self._clipboard_closed.set()
+        if deadline is None:
+            acquired = self._clipboard_lock.acquire()
+        else:
+            acquired = self._clipboard_lock.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+        if not acquired:
+            return
+        try:
+            proc = self._clipboard_proc
+            self._clipboard_proc = None
+            if proc is not None:
+                self._terminate_clipboard_process(proc, deadline=deadline)
+        finally:
+            self._clipboard_lock.release()
+
+    def _start_clipboard_owner(self, text: str) -> bool:
+        encoded = text.encode("utf-8")
+        with self._clipboard_lock:
+            if self._clipboard_closed.is_set():
+                return False
+            previous = self._clipboard_proc
+            self._clipboard_proc = None
+            if previous is not None:
+                self._terminate_clipboard_process(previous)
+            try:
+                proc = subprocess.Popen(
+                    ["xclip", "-quiet", "-selection", "clipboard"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                return False
+            try:
+                if proc.stdin is None:
+                    raise OSError("xclip stdin unavailable")
+                proc.stdin.write(encoded)
+                proc.stdin.close()
+                ready_deadline = time.monotonic() + CLIPBOARD_READY_TIMEOUT_SEC
+                while proc.poll() is None and time.monotonic() < ready_deadline:
+                    try:
+                        selection = subprocess.run(
+                            ["xclip", "-selection", "clipboard", "-out"],
+                            capture_output=True,
+                            timeout=0.25,
+                        )
+                    except (OSError, subprocess.TimeoutExpired):
+                        selection = None
+                    if (
+                        selection is not None
+                        and selection.returncode == 0
+                        and selection.stdout == encoded
+                    ):
+                        if self._clipboard_closed.is_set():
+                            break
+                        self._clipboard_proc = proc
+                        return True
+                    time.sleep(0.01)
+            except (BrokenPipeError, OSError):
+                pass
+            self._terminate_clipboard_process(proc)
+            return False
+
+    def _run_xdotool_if_open(self, command: list[str]) -> bool:
+        with self._clipboard_lock:
+            if self._clipboard_closed.is_set():
+                return False
+            try:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    timeout=XDOTOOL_TIMEOUT_SEC,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            return result.returncode == 0
+
+    def _insert(self, text: str) -> bool:
+        xclip_available = (
+            subprocess.run(["which", "xclip"], capture_output=True).returncode == 0
+        )
+        if not xclip_available or not self._start_clipboard_owner(text):
+            # Direct typing cannot be rolled back: a timeout can leave an
+            # arbitrary prefix in the target. Preserve the durable transcript
+            # and report failure without sending any text events instead.
+            return False
+        return self._run_xdotool_if_open(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
         )
 
     def _hotkey_label(self, cfg: dict[str, str]) -> str:

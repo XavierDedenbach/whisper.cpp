@@ -6,12 +6,15 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
+import wave
 from pathlib import Path
 from unittest import mock
 
@@ -721,6 +724,566 @@ class HangRecoveryTests(unittest.TestCase):
         with mock.patch("dictation.build_recorder_cmd", return_value=["parecord"]):
             return Dictation(defaults)
 
+    def test_clipboard_insert_owns_foreground_xclip_until_shutdown(self) -> None:
+        app = self._make_app()
+        owner = mock.Mock()
+        owner.stdin = mock.Mock()
+        owner.poll.return_value = None
+        which = subprocess.CompletedProcess(["which", "xclip"], 0, b"", b"")
+        ready = subprocess.CompletedProcess(["xclip"], 0, b"hello", b"")
+        pasted = subprocess.CompletedProcess(["xdotool"], 0, b"", b"")
+
+        with mock.patch("dictation.subprocess.Popen", return_value=owner) as popen:
+            with mock.patch(
+                "dictation.subprocess.run", side_effect=[which, ready, pasted]
+            ) as run:
+                app._insert("hello")
+
+        popen.assert_called_once_with(
+            ["xclip", "-quiet", "-selection", "clipboard"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        owner.stdin.write.assert_called_once_with(b"hello")
+        owner.stdin.close.assert_called_once_with()
+        self.assertIs(app._clipboard_proc, owner)
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(["which", "xclip"], capture_output=True),
+                mock.call(
+                    ["xclip", "-selection", "clipboard", "-out"],
+                    capture_output=True,
+                    timeout=0.25,
+                ),
+                mock.call(
+                    ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                    check=False,
+                    timeout=0.25,
+                ),
+            ],
+        )
+
+    def test_clipboard_owner_escalates_when_term_is_ignored(self) -> None:
+        app = self._make_app()
+        owner = mock.Mock()
+        owner.poll.return_value = None
+        owner.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="xclip", timeout=0.25),
+            0,
+        ]
+        app._clipboard_proc = owner
+
+        app._stop_clipboard_owner()
+
+        owner.terminate.assert_called_once_with()
+        owner.kill.assert_called_once_with()
+        self.assertEqual(owner.wait.call_count, 2)
+        self.assertIsNone(app._clipboard_proc)
+
+    def test_consecutive_clipboard_inserts_replace_previous_owner(self) -> None:
+        app = self._make_app()
+        first = mock.Mock()
+        first.stdin = mock.Mock()
+        first.poll.return_value = None
+        first.wait.return_value = 0
+        second = mock.Mock()
+        second.stdin = mock.Mock()
+        second.poll.return_value = None
+        which = subprocess.CompletedProcess(["which", "xclip"], 0, b"", b"")
+        first_ready = subprocess.CompletedProcess(["xclip"], 0, b"first", b"")
+        second_ready = subprocess.CompletedProcess(["xclip"], 0, b"second", b"")
+        pasted = subprocess.CompletedProcess(["xdotool"], 0, b"", b"")
+
+        with mock.patch(
+            "dictation.subprocess.Popen", side_effect=[first, second]
+        ) as popen:
+            with mock.patch(
+                "dictation.subprocess.run",
+                side_effect=[which, first_ready, pasted, which, second_ready, pasted],
+            ):
+                app._insert("first")
+                app._insert("second")
+
+        self.assertEqual(popen.call_count, 2)
+        first.terminate.assert_called_once_with()
+        first.wait.assert_called_once()
+        self.assertIs(app._clipboard_proc, second)
+
+    def test_wrong_clipboard_bytes_fail_without_partial_typing(self) -> None:
+        app = self._make_app()
+        owner = mock.Mock()
+        owner.stdin = mock.Mock()
+        owner.poll.return_value = None
+        owner.wait.return_value = 0
+        which = subprocess.CompletedProcess(["which", "xclip"], 0, b"", b"")
+        wrong = subprocess.CompletedProcess(["xclip"], 0, b"wrong", b"")
+
+        with mock.patch("dictation.subprocess.Popen", return_value=owner):
+            with mock.patch(
+                "dictation.subprocess.run", side_effect=[which, wrong]
+            ) as run:
+                with mock.patch(
+                    "dictation.time.monotonic", side_effect=[100.0, 100.0, 100.6]
+                ):
+                    with mock.patch("dictation.time.sleep"):
+                        self.assertFalse(app._insert("expected"))
+
+        owner.terminate.assert_called_once_with()
+        self.assertIsNone(app._clipboard_proc)
+        self.assertFalse(
+            any(call.args[0][0] == "xdotool" for call in run.call_args_list)
+        )
+
+    def test_xclip_unavailable_fails_without_partial_typing(self) -> None:
+        app = self._make_app()
+        unavailable = subprocess.CompletedProcess(["which", "xclip"], 1, b"", b"")
+
+        with mock.patch("dictation.subprocess.Popen") as popen:
+            with mock.patch(
+                "dictation.subprocess.run", return_value=unavailable
+            ) as run:
+                self.assertFalse(app._insert("fallback"))
+
+        popen.assert_not_called()
+        run.assert_called_once_with(["which", "xclip"], capture_output=True)
+
+    def test_clipboard_start_failure_fails_without_partial_typing(self) -> None:
+        app = self._make_app()
+        owner = mock.Mock()
+        owner.stdin = mock.Mock()
+        owner.poll.return_value = 1
+        which = subprocess.CompletedProcess(["which", "xclip"], 0, b"", b"")
+
+        with mock.patch("dictation.subprocess.Popen", return_value=owner):
+            with mock.patch("dictation.subprocess.run", return_value=which) as run:
+                self.assertFalse(app._insert("fallback"))
+
+        self.assertFalse(
+            any(call.args[0][0] == "xdotool" for call in run.call_args_list)
+        )
+        self.assertIsNone(app._clipboard_proc)
+
+    def test_xdotool_timeout_is_a_bounded_delivery_failure(self) -> None:
+        app = self._make_app()
+        command = ["xdotool", "key", "--clearmodifiers", "ctrl+v"]
+
+        with mock.patch(
+            "dictation.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(command, timeout=0.25),
+        ) as run:
+            self.assertFalse(app._run_xdotool_if_open(command))
+
+        run.assert_called_once_with(command, check=False, timeout=0.25)
+
+    def test_xdotool_nonzero_exit_is_a_delivery_failure(self) -> None:
+        app = self._make_app()
+        command = ["xdotool", "key", "--clearmodifiers", "ctrl+v"]
+        failed = subprocess.CompletedProcess(command, 1)
+
+        with mock.patch("dictation.subprocess.run", return_value=failed):
+            self.assertFalse(app._run_xdotool_if_open(command))
+
+    def test_clipboard_cleanup_refuses_late_owner_and_typing_fallback(self) -> None:
+        app = self._make_app()
+        current_owner = mock.Mock()
+        late_owner = mock.Mock()
+        late_owner.stdin = mock.Mock()
+        late_owner.poll.return_value = None
+        app._clipboard_proc = current_owner
+        cleanup_entered = threading.Event()
+        release_cleanup = threading.Event()
+
+        def block_cleanup(proc, **_kwargs) -> None:
+            self.assertIs(proc, current_owner)
+            cleanup_entered.set()
+            self.assertTrue(release_cleanup.wait(2))
+
+        def run_command(command, **_kwargs):
+            if command == ["which", "xclip"]:
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+            if command == ["xclip", "-selection", "clipboard", "-out"]:
+                return subprocess.CompletedProcess(command, 0, b"late", b"")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(
+            app, "_terminate_clipboard_process", side_effect=block_cleanup
+        ):
+            with mock.patch(
+                "dictation.subprocess.Popen", return_value=late_owner
+            ) as popen:
+                with mock.patch(
+                    "dictation.subprocess.run", side_effect=run_command
+                ) as run:
+                    cleanup = threading.Thread(target=app._stop_clipboard_owner)
+                    cleanup.start()
+                    self.assertTrue(cleanup_entered.wait(1))
+                    worker = threading.Thread(target=app._insert, args=("late",))
+                    worker.start()
+                    try:
+                        self.assertTrue(worker.is_alive())
+                    finally:
+                        release_cleanup.set()
+                        cleanup.join(2)
+                        worker.join(2)
+
+        self.assertFalse(cleanup.is_alive())
+        self.assertFalse(worker.is_alive())
+        popen.assert_not_called()
+        self.assertFalse(
+            any(call.args[0][0] == "xdotool" for call in run.call_args_list)
+        )
+
+    def test_clipboard_cleanup_suppresses_paste_from_ready_worker(self) -> None:
+        app = self._make_app()
+        owner_ready = threading.Event()
+        release_owner = threading.Event()
+
+        def start_owner(_text: str) -> bool:
+            owner_ready.set()
+            self.assertTrue(release_owner.wait(2))
+            return True
+
+        which = subprocess.CompletedProcess(["which", "xclip"], 0, b"", b"")
+        pasted = subprocess.CompletedProcess(["xdotool"], 0, b"", b"")
+        with mock.patch.object(app, "_start_clipboard_owner", side_effect=start_owner):
+            with mock.patch(
+                "dictation.subprocess.run", side_effect=[which, pasted]
+            ) as run:
+                worker = threading.Thread(target=app._insert, args=("ready",))
+                worker.start()
+                self.assertTrue(owner_ready.wait(1))
+                app._stop_clipboard_owner()
+                release_owner.set()
+                worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(
+            run.call_args_list, [mock.call(["which", "xclip"], capture_output=True)]
+        )
+
+    def test_shutdown_rejects_start_after_terminal_state_is_published(self) -> None:
+        app = self._make_app()
+        app.cli = mock.Mock()
+        app.cli.is_file.return_value = True
+        app.model = mock.Mock()
+        app.model.is_file.return_value = True
+        app._store = mock.Mock()
+        app._store.start_session.return_value = Path("/tmp/late-session")
+        app._chunk_queue = mock.Mock(unfinished_tasks=0)
+        app._tray = mock.Mock()
+        finalizer_entered = threading.Event()
+        release_finalizer = threading.Event()
+
+        def block_finalizer(*, deadline: float) -> None:
+            self.assertGreater(deadline, time.monotonic())
+            finalizer_entered.set()
+            self.assertTrue(release_finalizer.wait(2))
+
+        with mock.patch.object(app, "_finish_recording", side_effect=block_finalizer):
+            with mock.patch.object(app, "_stop_clipboard_owner"):
+                with mock.patch.object(
+                    app,
+                    "_spawn_recorder",
+                    return_value=(mock.Mock(), "/tmp/late.wav"),
+                ) as spawn:
+                    with mock.patch.object(app, "_start_recorder_watch"):
+                        shutdown = threading.Thread(target=app.shutdown, args=(0,))
+                        shutdown.start()
+                        self.assertTrue(finalizer_entered.wait(1))
+                        starter = threading.Thread(target=app._start_recording)
+                        starter.start()
+                        starter.join(1)
+                        release_finalizer.set()
+                        shutdown.join(2)
+
+        self.assertFalse(starter.is_alive())
+        self.assertFalse(shutdown.is_alive())
+        spawn.assert_not_called()
+        app._store.start_session.assert_not_called()
+        self.assertFalse(app._recording)
+
+    def test_shutdown_waits_for_concurrent_finalizer(self) -> None:
+        app = self._make_app()
+        app._recording = True
+        app._record_proc = mock.Mock()
+        app._wav_path = "/tmp/finalizing.wav"
+        app._record_start = time.monotonic() - 1
+        app._session_id = 1
+        app._session_paths = {1: Path("/tmp/session")}
+        app._active_session = app._session_paths[1]
+        app._store = mock.Mock()
+        app._tray = mock.Mock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_stop(*_args, **_kwargs) -> bool:
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return True
+
+        with mock.patch("dictation.graceful_stop_recorder", side_effect=blocked_stop):
+            with mock.patch.object(app, "_stage_chunk"):
+                finisher = threading.Thread(target=app._finish_recording)
+                finisher.start()
+                self.assertTrue(entered.wait(1))
+                stopped = threading.Event()
+                shutdown = threading.Thread(
+                    target=lambda: (app.shutdown(0), stopped.set())
+                )
+                shutdown.start()
+                try:
+                    self.assertFalse(stopped.wait(0.2))
+                finally:
+                    release.set()
+                    finisher.join(2)
+                    shutdown.join(2)
+        self.assertTrue(stopped.is_set())
+
+    def test_shutdown_finalizes_and_reaps_active_recorder(self) -> None:
+        app = self._make_app(RECORDER_STOP_FLUSH_MSEC="0")
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            wav_path = temp / "active.wav"
+            recorder = temp / "recorder.py"
+            recorder.write_text(
+                textwrap.dedent(
+                    """
+                    import signal
+                    import sys
+                    import time
+                    import wave
+
+                    running = True
+
+                    def stop(*_args):
+                        global running
+                        running = False
+
+                    signal.signal(signal.SIGINT, stop)
+                    with wave.open(sys.argv[1], "wb") as output:
+                        output.setnchannels(1)
+                        output.setsampwidth(2)
+                        output.setframerate(16000)
+                        while running:
+                            output.writeframes(b"\\x00\\x01" * 160)
+                            time.sleep(0.01)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            proc = subprocess.Popen(
+                [sys.executable, str(recorder), str(wav_path)],
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and (
+                not wav_path.exists() or wav_path.stat().st_size < 1000
+            ):
+                time.sleep(0.01)
+
+            app._recording = True
+            app._record_proc = proc
+            app._wav_path = str(wav_path)
+            app._record_start = time.monotonic() - 1
+            app._session_id = 1
+            app._session_paths = {1: temp / "session"}
+            app._active_session = app._session_paths[1]
+            app._store = mock.Mock()
+            app._tray = mock.Mock()
+            app._tray.stop.side_effect = lambda *_args, **_kwargs: events.append("tray")
+
+            def ingest(*_args, **_kwargs) -> None:
+                with wave.open(str(wav_path), "rb") as source:
+                    self.assertGreater(source.getnframes(), 0)
+                events.append("ingest")
+
+            with mock.patch.object(app, "_stage_chunk", side_effect=ingest):
+                with mock.patch.object(
+                    app,
+                    "_stop_clipboard_owner",
+                    side_effect=lambda *_args, **_kwargs: events.append("clipboard"),
+                ):
+                    app.shutdown(0)
+
+            self.assertIsNotNone(proc.poll())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(proc.pid, 0)
+            self.assertLess(events.index("ingest"), events.index("clipboard"))
+            self.assertLess(events.index("ingest"), events.index("tray"))
+
+    def test_shutdown_failure_paths_fit_service_deadline(self) -> None:
+        from dictation import (
+            CLIPBOARD_KILL_TIMEOUT_SEC,
+            CLIPBOARD_TERM_TIMEOUT_SEC,
+            SHUTDOWN_BUDGET_SEC,
+            SHUTDOWN_RESOURCE_RESERVE_SEC,
+            TRAY_STOP_TIMEOUT_SEC,
+        )
+
+        self.assertLess(SHUTDOWN_BUDGET_SEC, 14.0)
+        self.assertGreaterEqual(
+            SHUTDOWN_RESOURCE_RESERVE_SEC,
+            CLIPBOARD_TERM_TIMEOUT_SEC
+            + CLIPBOARD_KILL_TIMEOUT_SEC
+            + TRAY_STOP_TIMEOUT_SEC,
+        )
+        app = self._make_app()
+        app._recording = False
+        app._store = mock.Mock()
+        app._chunk_queue = mock.Mock(unfinished_tasks=0)
+        app._tray = mock.Mock()
+        with mock.patch.object(app, "_finish_recording") as finish:
+            with mock.patch.object(app, "_stop_clipboard_owner") as clipboard:
+                app.shutdown()
+        work_deadline = finish.call_args.kwargs["deadline"]
+        shutdown_deadline = clipboard.call_args.kwargs["deadline"]
+        self.assertAlmostEqual(
+            shutdown_deadline - work_deadline,
+            SHUTDOWN_RESOURCE_RESERVE_SEC,
+            places=2,
+        )
+        app._tray.stop.assert_called_once_with(
+            timeout=TRAY_STOP_TIMEOUT_SEC,
+        )
+
+    def test_shutdown_deadline_bounds_blocked_finalizer_and_remaining_cleanup(
+        self,
+    ) -> None:
+        class FakeClock:
+            def __init__(self) -> None:
+                self.now = 100.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        class BlockedLock:
+            def __init__(self, clock: FakeClock) -> None:
+                self.clock = clock
+                self.timeout: float | None = None
+
+            def acquire(self, *, timeout: float) -> bool:
+                self.timeout = timeout
+                self.clock.now += timeout
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("an unacquired lock must not be released")
+
+        clock = FakeClock()
+        blocked_lock = BlockedLock(clock)
+        app = self._make_app()
+        app._finalize_lock = blocked_lock
+        app._store = mock.Mock()
+        app._chunk_queue = mock.Mock(unfinished_tasks=0)
+        app._tray = mock.Mock()
+
+        def stop_clipboard(*, deadline: float) -> None:
+            self.assertEqual(deadline, 113.0)
+            clock.now += 0.75
+
+        with mock.patch("dictation.time.monotonic", side_effect=clock.monotonic):
+            with mock.patch.object(
+                app, "_stop_clipboard_owner", side_effect=stop_clipboard
+            ):
+                app.shutdown(0)
+
+        self.assertEqual(blocked_lock.timeout, 12.0)
+        app._tray.stop.assert_called_once_with(timeout=0.25)
+
+    def test_tray_indicator_owns_and_reaps_daemon_runner(self) -> None:
+        from dictation_indicator import TrayIndicator
+
+        running = threading.Event()
+        release = threading.Event()
+        icon = mock.Mock()
+
+        def run_icon(*, setup) -> None:
+            setup(icon)
+            running.set()
+            release.wait(2)
+
+        icon.run.side_effect = run_icon
+        icon.stop.side_effect = release.set
+
+        with mock.patch("dictation_indicator.pystray.Icon", return_value=icon):
+            tray = TrayIndicator()
+            self.assertTrue(tray.start())
+            self.assertTrue(running.wait(1))
+            self.assertIsNotNone(tray._thread)
+            self.assertTrue(tray._thread.daemon)
+            tray.stop(timeout=0.25)
+
+        icon.run.assert_called_once()
+        icon.stop.assert_called_once_with()
+        self.assertFalse(tray._thread.is_alive())
+
+    def test_tray_stop_is_bounded_when_backend_blocks(self) -> None:
+        from dictation_indicator import TrayIndicator
+
+        running = threading.Event()
+        runner_release = threading.Event()
+        stop_release = threading.Event()
+        icon = mock.Mock()
+
+        def run_icon(*, setup) -> None:
+            setup(icon)
+            running.set()
+            runner_release.wait(2)
+
+        icon.run.side_effect = run_icon
+        icon.stop.side_effect = lambda: stop_release.wait(2)
+
+        with mock.patch("dictation_indicator.pystray.Icon", return_value=icon):
+            tray = TrayIndicator()
+            self.assertTrue(tray.start())
+            self.assertTrue(running.wait(1))
+            started = time.monotonic()
+            tray.stop(timeout=0.05)
+            elapsed = time.monotonic() - started
+            runner_release.set()
+            stop_release.set()
+            tray._thread.join(1)
+
+        self.assertLess(elapsed, 0.2)
+        self.assertTrue(tray._thread.daemon)
+        self.assertFalse(tray._thread.is_alive())
+
+    def test_tray_start_reports_immediate_runner_failure(self) -> None:
+        from dictation_indicator import TrayIndicator
+
+        icon = mock.Mock()
+        icon.run.side_effect = OSError("display closed")
+
+        with mock.patch("dictation_indicator.pystray.Icon", return_value=icon):
+            tray = TrayIndicator()
+            self.assertFalse(tray.start())
+
+        self.assertIsNone(tray._icon)
+        self.assertFalse(tray._running)
+
+    def test_tray_start_reports_delayed_runner_failure(self) -> None:
+        from dictation_indicator import TrayIndicator
+
+        icon = mock.Mock()
+
+        def delayed_failure(*_args, **_kwargs) -> None:
+            time.sleep(0.1)
+            raise OSError("display closed after startup began")
+
+        icon.run.side_effect = delayed_failure
+
+        with mock.patch("dictation_indicator.pystray.Icon", return_value=icon):
+            tray = TrayIndicator()
+            started = tray.start()
+            tray._thread.join(1)
+
+        self.assertFalse(started)
+        self.assertIsNone(tray._icon)
+        self.assertFalse(tray._running)
+
     def test_server_request_uses_no_timestamp_greedy_profile(self) -> None:
         for build_dir in ("build", "build-cuda", "build-sycl"):
             with self.subTest(build_dir=build_dir):
@@ -869,10 +1432,8 @@ class HangRecoveryTests(unittest.TestCase):
                         app, "_transcribe", return_value=punctuation
                     ):
                         with mock.patch("dictation.wav_rms", return_value=400.0):
-                            with mock.patch.object(app, "_insert_chunk") as insert:
-                                with mock.patch.object(app, "_notify"):
-                                    app._deliver_chunk(job)
-                    insert.assert_not_called()
+                            with mock.patch.object(app, "_notify"):
+                                app._deliver_chunk(job)
                     app._store.terminal.assert_called_once()
         finally:
             os.unlink(handle.name)
@@ -881,6 +1442,29 @@ class HangRecoveryTests(unittest.TestCase):
         from dictation import is_likely_hallucination
 
         self.assertTrue(is_likely_hallucination("End of video."))
+
+    def test_whisper_prompt_is_an_unfinished_cue(self) -> None:
+        from vocab_prompt import build_whisper_prompt
+
+        with mock.patch(
+            "vocab_prompt.load_all_vocabulary", return_value=(["CUDA", "SYCL"], [])
+        ):
+            prompt = build_whisper_prompt(
+                {
+                    "WHISPER_PROMPT_PREFIX": "Technical dictation.",
+                    "WHISPER_VOCABULARY_FILE": "/dev/null",
+                }
+            )
+
+        self.assertEqual(prompt, "Technical dictation: CUDA, SYCL")
+
+    def test_explicit_whisper_prompt_is_preserved_verbatim(self) -> None:
+        from vocab_prompt import build_whisper_prompt
+
+        with mock.patch("vocab_prompt.load_all_vocabulary", return_value=([], [])):
+            prompt = build_whisper_prompt({"WHISPER_PROMPT": "Exact prompt."})
+
+        self.assertEqual(prompt, "Exact prompt.")
 
     def test_server_timeout_restarts_then_retries_without_gpu_cli(self) -> None:
         app = self._make_app()
@@ -1025,24 +1609,8 @@ class HangRecoveryTests(unittest.TestCase):
         proc.send_signal.side_effect = ProcessLookupError
         proc.wait.return_value = 0
         with mock.patch("dictation.os.getpgid", side_effect=ProcessLookupError):
-            graceful_stop_recorder(proc, None, 0)
+            self.assertTrue(graceful_stop_recorder(proc, None, 0))
         proc.wait.assert_called_once_with(timeout=5.0)
-
-    def test_prefix_chunk_for_insert_adds_single_space(self) -> None:
-        from dictation import prefix_chunk_for_insert
-
-        text, need = prefix_chunk_for_insert(False, "  hello world  ")
-        self.assertEqual(text, "hello world")
-        self.assertTrue(need)
-        text, need = prefix_chunk_for_insert(True, "again")
-        self.assertEqual(text, " again")
-        self.assertTrue(need)
-        text, need = prefix_chunk_for_insert(True, ". Next")
-        self.assertEqual(text, ". Next")
-        empty, need = prefix_chunk_for_insert(True, "   ")
-        self.assertEqual(text, ". Next")
-        self.assertEqual(empty, "")
-        self.assertTrue(need)
 
     def test_roll_releases_old_before_starting_next_recorder(self) -> None:
         app = self._make_app()
@@ -1060,8 +1628,9 @@ class HangRecoveryTests(unittest.TestCase):
             events.append("spawn-next")
             return new_proc, "/tmp/new.wav"
 
-        def stop(*_args):
+        def stop(*_args, **_kwargs):
             events.append("stop-old")
+            return True
 
         def stage(*_args):
             events.append("stage-old")
@@ -1092,6 +1661,55 @@ class HangRecoveryTests(unittest.TestCase):
         stage_call.assert_called_once()
         self.assertEqual(stage_call.call_args[0][0], "/tmp/old.wav")
         self.assertEqual(stage_call.call_args[0][3], 7)
+
+    def test_roll_retains_old_owner_when_second_reap_times_out(self) -> None:
+        app = self._make_app()
+        old_proc = mock.Mock(pid=4321)
+        old_proc.poll.return_value = None
+        old_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="parecord", timeout=5.0),
+            subprocess.TimeoutExpired(cmd="parecord", timeout=0.25),
+        ]
+        app._recording = True
+        app._record_proc = old_proc
+        app._wav_path = "/tmp/still-writing.wav"
+        app._record_start = time.monotonic() - 45
+        app._record_generation = 6
+        app._session_id = 7
+        app._tray = mock.Mock()
+
+        with mock.patch("dictation.os.getpgid", return_value=4321):
+            with mock.patch("dictation.os.killpg") as killpg:
+                with mock.patch("dictation.wait_for_wav_stable") as stable:
+                    with mock.patch.object(
+                        app,
+                        "_spawn_recorder",
+                        return_value=(mock.Mock(), "/tmp/new.wav"),
+                    ) as spawn:
+                        with mock.patch.object(app, "_stage_chunk") as stage:
+                            with mock.patch.object(
+                                app, "_start_recorder_watch"
+                            ) as watch:
+                                with mock.patch("dictation.sys.stderr"):
+                                    app._roll_recording()
+
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(4321, signal.SIGINT),
+                mock.call(4321, signal.SIGKILL),
+            ],
+        )
+        self.assertEqual(old_proc.wait.call_count, 2)
+        stable.assert_not_called()
+        spawn.assert_not_called()
+        stage.assert_not_called()
+        watch.assert_not_called()
+        self.assertTrue(app._recording)
+        self.assertIs(app._record_proc, old_proc)
+        self.assertEqual(app._wav_path, "/tmp/still-writing.wav")
+        self.assertEqual(app._record_generation, 6)
+        self.assertEqual(app._chunk_seq, 0)
 
     def test_unexpected_recorder_exit_restarts_and_stages_partial_chunk(self) -> None:
         app = self._make_app()
@@ -1184,8 +1802,7 @@ class HangRecoveryTests(unittest.TestCase):
                     with mock.patch.object(
                         app, "_transcribe", return_value="words after recovery"
                     ):
-                        with mock.patch.object(app, "_insert_chunk"):
-                            app._deliver_chunk(jobs[1])
+                        app._deliver_chunk(jobs[1])
             app._store.stop_session(session)
             transcript = (session / "transcript.txt").read_text(encoding="utf-8")
             self.assertIn("[no_text: chunk 0000", transcript)
@@ -1235,9 +1852,10 @@ class HangRecoveryTests(unittest.TestCase):
         release_stop = threading.Event()
         watcher_attempted = threading.Event()
 
-        def stop(*_args):
+        def stop(*_args, **_kwargs):
             stop_entered.set()
             release_stop.wait(timeout=2)
+            return True
 
         def watcher():
             watcher_attempted.set()
@@ -1334,10 +1952,16 @@ class HangRecoveryTests(unittest.TestCase):
         app._tray = mock.Mock()
         stop_entered = threading.Event()
         release_stop = threading.Event()
+        watcher_attempted = threading.Event()
 
-        def stop(*_args):
+        def stop(*_args, **_kwargs):
             stop_entered.set()
             release_stop.wait(timeout=2)
+            return True
+
+        def watcher():
+            watcher_attempted.set()
+            app._handle_recorder_exit(proc, "/tmp/final.wav", 1, "exit 17")
 
         with mock.patch.object(app, "_spawn_recorder") as spawn:
             with mock.patch("dictation.graceful_stop_recorder", side_effect=stop):
@@ -1346,16 +1970,18 @@ class HangRecoveryTests(unittest.TestCase):
                     finish_thread.start()
                     self.assertTrue(stop_entered.wait(timeout=1))
                     watcher_thread = threading.Thread(
-                        target=app._handle_recorder_exit,
-                        args=(proc, "/tmp/final.wav", 1, "exit 17"),
+                        target=watcher,
                     )
                     watcher_thread.start()
-                    watcher_thread.join(timeout=1)
-                    self.assertFalse(watcher_thread.is_alive())
+                    self.assertTrue(watcher_attempted.wait(timeout=1))
+                    time.sleep(0.02)
+                    self.assertTrue(watcher_thread.is_alive())
                     release_stop.set()
                     finish_thread.join(timeout=2)
+                    watcher_thread.join(timeout=2)
 
         self.assertFalse(finish_thread.is_alive())
+        self.assertFalse(watcher_thread.is_alive())
         spawn.assert_not_called()
         stage.assert_called_once()
         self.assertEqual(stage.call_args.args[2:], (0, 5))
@@ -1498,6 +2124,153 @@ class HangRecoveryTests(unittest.TestCase):
             retained = session / manifest["chunks"][0]["wav"]
             self.assertEqual(retained.read_bytes(), b"R" * 2048)
 
+    def test_unreaped_rejected_recorder_blocks_a_new_recording(self) -> None:
+        app = self._make_app()
+        app.cli = mock.Mock()
+        app.cli.is_file.return_value = True
+        app.model = mock.Mock()
+        app.model.is_file.return_value = True
+        app._notify = mock.Mock()
+        entered = threading.Event()
+        release = threading.Event()
+        proc = mock.Mock(pid=4321)
+
+        def wait() -> int:
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return 0
+
+        proc.wait.side_effect = wait
+        with tempfile.NamedTemporaryFile(delete=False) as wav:
+            wav_path = wav.name
+        try:
+            app._retain_rejected_recorder(proc, wav_path)
+            self.assertTrue(entered.wait(1))
+            try:
+                with mock.patch.object(
+                    app, "_spawn_recorder", return_value=None
+                ) as spawn:
+                    app._start_recording()
+                spawn.assert_not_called()
+            finally:
+                release.set()
+        finally:
+            try:
+                os.unlink(wav_path)
+            except FileNotFoundError:
+                pass
+
+    def test_long_session_pastes_all_completed_chunks_once_at_the_end(self) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with mock.patch.object(Dictation, "_transcribe_worker"):
+                app = self._make_app()
+            app._store = SessionStore(root / "sessions")
+            session = app._store.start_session()
+            jobs = []
+            for index in range(4):
+                source = root / f"source-{index}.wav"
+                source.write_bytes(b"R" * 2048)
+                jobs.append(app._store.ingest(session, index, source, 45.0))
+
+            with mock.patch("dictation.wav_rms", return_value=500.0):
+                with mock.patch.object(
+                    app,
+                    "_transcribe",
+                    side_effect=["first", "second", "third", "last partial"],
+                ):
+                    with mock.patch.object(app, "_insert", return_value=True) as insert:
+                        with mock.patch.object(app, "_notify"):
+                            for job in jobs:
+                                app._deliver_chunk(job)
+                                self.assertEqual(insert.call_count, 0)
+                            app._deliver_completed_session(session, session_id=1)
+
+            insert.assert_called_once_with("first second third last partial")
+            self.assertEqual(
+                (session / "transcript.txt").read_text(encoding="utf-8"),
+                "first\nsecond\nthird\nlast partial\n",
+            )
+
+    def test_short_final_tail_still_pastes_prior_completed_chunks_once(self) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with mock.patch.object(Dictation, "_transcribe_worker"):
+                app = self._make_app()
+            app._store = SessionStore(root / "sessions")
+            app._chunk_queue = queue.Queue()
+            app._recording = False
+            app._session_id = 1
+            app._notify = mock.Mock()
+            app._insert = mock.Mock(return_value=True)
+            session = app._store.start_session()
+
+            first_source = root / "first.wav"
+            first_source.write_bytes(b"R" * 2048)
+            first = app._store.ingest(session, 0, first_source, 45.0)
+            tail_source = root / "tail.wav"
+            tail_source.write_bytes(b"R" * 128)
+            tail = app._store.ingest(session, 1, tail_source, 0.1, finalize=True)
+
+            with mock.patch("dictation.wav_rms", return_value=500.0):
+                with mock.patch.object(app, "_transcribe", return_value="first"):
+                    worker = threading.Thread(
+                        target=app._transcribe_worker, daemon=True
+                    )
+                    worker.start()
+                    app._chunk_queue.put(first)
+                    app._chunk_queue.put(tail)
+                    app._chunk_queue.join()
+                    app._chunk_queue.put(None)
+                    worker.join(2)
+
+            app._insert.assert_called_once_with("first")
+
+    def test_final_ingest_failure_queues_delivery_of_prior_chunks(self) -> None:
+        from dictation import SessionPasteJob
+        from session_store import ChunkJob
+
+        app = self._make_app()
+        app._chunk_queue = queue.Queue()
+        app._next_submit = 0
+        app._staged = {}
+        session = Path("/tmp/session")
+        app._session_paths = {3: session}
+        first = ChunkJob(session, 0, Path("/tmp/first.wav"), 45.0, True, 3)
+        app._store = mock.Mock()
+        app._store.ingest.side_effect = [first, OSError("disk full")]
+
+        app._stage_chunk("/tmp/first.wav", 45.0, 0, 3)
+        app._stage_chunk("/tmp/final.wav", 5.0, 1, 3, finalize=True)
+
+        self.assertIs(app._chunk_queue.get_nowait(), first)
+        marker = app._chunk_queue.get_nowait()
+        self.assertEqual(marker, SessionPasteJob(session, 3))
+        app._store.record_gap.assert_called_once_with(session, 1, 5.0, "disk full")
+
+    def test_session_paste_failure_does_not_kill_the_worker(self) -> None:
+        from dictation import SessionPasteJob
+
+        app = self._make_app()
+        app._chunk_queue = queue.Queue()
+        app._notify = mock.Mock()
+        app._deliver_completed_session = mock.Mock(
+            side_effect=[RuntimeError("target vanished"), None]
+        )
+        worker = threading.Thread(target=app._transcribe_worker, daemon=True)
+        worker.start()
+        app._chunk_queue.put(SessionPasteJob(Path("/tmp/first"), 1))
+        app._chunk_queue.put(SessionPasteJob(Path("/tmp/second"), 2))
+        app._chunk_queue.put(None)
+        worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(app._deliver_completed_session.call_count, 2)
+
     def test_short_empty_tail_is_not_reported_as_microphone_failure(self) -> None:
         from session_store import ChunkJob
 
@@ -1529,8 +2302,7 @@ class HangRecoveryTests(unittest.TestCase):
                     app._finish_recording()
         spawn.assert_not_called()
         self.assertFalse(app._recording)
-        stage.assert_called_once()
-        self.assertEqual(stage.call_args[0][0], "/tmp/last.wav")
+        stage.assert_called_once_with("/tmp/last.wav", mock.ANY, 0, 0, finalize=True)
 
     def test_chunks_enter_worker_in_seq_order(self) -> None:
         from session_store import ChunkJob

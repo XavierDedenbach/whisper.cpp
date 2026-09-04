@@ -16,6 +16,10 @@
 **Context strategy:** current context (dictation-only; preserve unrelated working-tree edits)  
 **Scope:**
 
+**Post-completion amendment:** `dictation-session-atomic-delivery.md` replaces
+the historical direct-typing alternative with one verified-ready clipboard
+paste. This plan's model, server, and accuracy outcomes remain unchanged.
+
 **In**
 - Upgrade default dictation model path from `tiny.en` → `small.en` (Option 1; `small.en-q8_0` is not offered by `download-ggml-model.sh`)
 - Expose accuracy knobs: `WHISPER_PROMPT`, suppress non-speech (`-sns`), language `en`
@@ -47,7 +51,7 @@ After Ctrl+Space → speak → Ctrl+Space:
 | Affected contract | Existing behavior | Characterization test | Allowed change |
 |---|---|---|---|
 | Hotkey UX | Ctrl+Space toggle start/stop | Manual / existing daemon | Unchanged |
-| Paste path | clipboard `ctrl+v` or `xdotool type` | Unit-level insert unchanged | Unchanged |
+| Paste path | clipboard `ctrl+v` or `xdotool type` (historical) | Unit-level insert unchanged | Superseded by the session-atomic delivery amendment above |
 | Singleton | One daemon via flock | Second process exits 0 | Unchanged |
 | Autostart | systemd only | No `.desktop` dual-start | Unchanged |
 | Config file | `~/.config/whisper-dictation/config.env` | New keys optional with defaults | Additive keys only |
