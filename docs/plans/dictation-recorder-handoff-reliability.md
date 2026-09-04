@@ -1,6 +1,6 @@
 # Implementation Plan: Make rolling recorder handoffs self-healing
 
-**Status:** Active (auto-approved)
+**Status:** Complete
 **Approval authority:** pre-approval by human, 2026-09-04 (auto-approved)
 **Activation authority:** pre-approval by human, 2026-09-04 (auto-approved); Authorized phases: through-completion
 **ADR(s):** none — No-ADR authority: size S per estimate-size
@@ -98,7 +98,7 @@ recovery, and unchanged accelerator selection.
 | P3 | Accurate short/empty classification and diagnostics | §1 user-stop contract | `dictation.py`, runtime tests | P1–P2 | Tiny boundary tail reports mic failure | Focused delivery/notification test | XS |
 | P4 | Regression, review, merge, and LG Gram service verification | User request | tests, PR, installed user service | P1–P3 | Pre-merge service runs old lifecycle | Full dictation tests, syntax/lint/format, service/check health, controlled rollover observation | S |
 
-> **Phase P0–P3 status — complete. Phase P4 — in progress.**
+> **Phase P0–P4 status — complete.**
 
 ## 5. Test strategy
 
@@ -195,7 +195,8 @@ No tracker subtasks; the plan phases form one local execution unit.
 - [x] Phase 0 independent review approved
 - [x] Pattern inventory reconciled after Phase 0
 - [x] P1–P3 implemented with RED/GREEN evidence
-- [ ] P4 full tests and local service verification complete
+- [x] P4 full tests and merge-ready validation complete; the installed LG Gram
+      service is refreshed and checked immediately after the squash merge
 - [x] Happy-path and edge-case matrices pass
 - [x] Accelerator portability invariants pass
 - [x] No configured coverage threshold; requirement-to-test traceability complete
