@@ -60,6 +60,11 @@ MODIFIER_KEYS = {
 NOTIFY_REPLACE_ID = "4242"
 SERVER_UNIT = "whisper-dictation-server.service"
 _CHUNK_NO_SPACE_PREFIX = set(".,!?;:")
+MIN_USABLE_WAV_BYTES = 1000
+RECORDER_START_ATTEMPTS = 3
+RECORDER_START_TIMEOUT_SEC = 1.0
+RECORDER_RETRY_DELAY_SEC = 0.05
+RECORDER_WATCH_POLL_SEC = 0.05
 
 
 def prefix_chunk_for_insert(need_space: bool, chunk: str) -> tuple[str, bool]:
@@ -148,6 +153,7 @@ def graceful_stop_recorder(
     proc: subprocess.Popen | None,
     wav_path: str | None,
     flush_msec: float,
+    wait_timeout: float = 5.0,
 ) -> None:
     """Keep recording briefly to capture buffered tail audio, then finalize WAV."""
     if flush_msec > 0 and proc and proc.poll() is None:
@@ -159,9 +165,12 @@ def graceful_stop_recorder(
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGINT)
     except ProcessLookupError:
-        proc.send_signal(signal.SIGINT)
+        try:
+            proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
     try:
-        proc.wait(timeout=5)
+        proc.wait(timeout=wait_timeout)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -388,6 +397,8 @@ class Dictation:
         self._record_proc: subprocess.Popen | None = None
         self._record_start = 0.0
         self._session_start = 0.0
+        self._record_generation = 0
+        self._last_recorder_error = ""
         self._lock = threading.Lock()
         self._max_timer: threading.Timer | None = None
         self._recorder = build_recorder_cmd(self.audio_source, cfg)
@@ -487,35 +498,113 @@ class Dictation:
         self._cancel_max_timer()
         if self.max_record <= 0:
             return
-        timer = threading.Timer(self.max_record, self._on_max_record)
+        timer = threading.Timer(
+            self.max_record,
+            self._on_max_record,
+            args=(self._record_generation,),
+        )
         timer.daemon = True
         self._max_timer = timer
         timer.start()
 
-    def _on_max_record(self) -> None:
+    def _on_max_record(self, generation: int) -> None:
         with self._lock:
-            if not self._recording:
+            if not self._recording or generation != self._record_generation:
                 return
-        self._roll_recording()
+        self._roll_recording(expected_generation=generation)
+
+    @staticmethod
+    def _read_recorder_stderr(proc: subprocess.Popen) -> str:
+        stream = getattr(proc, "stderr", None)
+        if stream is None:
+            return ""
+        try:
+            output = stream.read()
+        except (OSError, ValueError):
+            return ""
+        finally:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+        if isinstance(output, bytes):
+            return output.decode("utf-8", errors="replace").strip()
+        return str(output or "").strip()
+
+    def _recorder_exit_detail(self, proc: subprocess.Popen) -> str:
+        code = proc.poll()
+        detail = f"exit {code}" if code is not None else "no audio payload"
+        stderr = self._read_recorder_stderr(proc)
+        if stderr:
+            detail += f": {' '.join(stderr.split())[:200]}"
+        return detail
+
+    def _wait_for_recorder_ready(
+        self, proc: subprocess.Popen, path: str
+    ) -> tuple[bool, str]:
+        deadline = time.monotonic() + RECORDER_START_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return False, self._recorder_exit_detail(proc)
+            try:
+                if os.path.getsize(path) >= MIN_USABLE_WAV_BYTES:
+                    return True, ""
+            except FileNotFoundError:
+                pass
+            time.sleep(0.01)
+
+        if proc.poll() is None:
+            graceful_stop_recorder(proc, path, 0, wait_timeout=0.5)
+        detail = self._recorder_exit_detail(proc)
+        return (
+            False,
+            f"no audio payload within {RECORDER_START_TIMEOUT_SEC:.2f}s ({detail})",
+        )
 
     def _spawn_recorder(self) -> tuple[subprocess.Popen, str] | None:
-        """Start parecord/pw-record into a new temp WAV. Caller holds no assumptions."""
+        """Start and validate a recorder, retrying bounded startup failures."""
         if not self._recorder:
+            self._last_recorder_error = "no recorder command is available"
             return None
-        fd, path = tempfile.mkstemp(suffix=".wav", prefix="whisper-dictation-")
-        os.close(fd)
         wake_audio_source(self.audio_source)
-        try:
-            proc = subprocess.Popen(
-                [*self._recorder, path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
+        self._last_recorder_error = ""
+        for attempt in range(1, RECORDER_START_ATTEMPTS + 1):
+            fd, path = tempfile.mkstemp(suffix=".wav", prefix="whisper-dictation-")
+            os.close(fd)
+            try:
+                proc = subprocess.Popen(
+                    [*self._recorder, path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                self._last_recorder_error = str(exc)
+                os.unlink(path)
+                break
+
+            ready, detail = self._wait_for_recorder_ready(proc, path)
+            if ready:
+                if attempt > 1:
+                    print(
+                        f"whisper-dictation: recorder recovered on startup attempt {attempt}",
+                        file=sys.stderr,
+                    )
+                return proc, path
+
+            self._last_recorder_error = detail
+            print(
+                f"whisper-dictation: recorder start attempt {attempt}/"
+                f"{RECORDER_START_ATTEMPTS} failed: {detail}",
+                file=sys.stderr,
             )
-        except FileNotFoundError:
-            os.unlink(path)
-            return None
-        return proc, path
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            if attempt < RECORDER_START_ATTEMPTS and RECORDER_RETRY_DELAY_SEC > 0:
+                time.sleep(RECORDER_RETRY_DELAY_SEC)
+        return None
 
     def _stage_chunk(
         self, wav: str | None, duration: float, seq: int, session_id: int
@@ -601,9 +690,91 @@ class Dictation:
             self._insert(pasted)
         return pasted
 
+    def _activate_recorder_locked(self, spawned: tuple[subprocess.Popen, str]) -> int:
+        self._record_proc, self._wav_path = spawned
+        self._record_start = time.monotonic()
+        self._record_generation += 1
+        self._arm_max_timer()
+        return self._record_generation
+
+    def _start_recorder_watch(
+        self, proc: subprocess.Popen, wav: str, generation: int
+    ) -> None:
+        watcher = threading.Thread(
+            target=self._watch_recorder,
+            args=(proc, wav, generation),
+            name=f"whisper-recorder-{generation}",
+            daemon=True,
+        )
+        watcher.start()
+
+    def _watch_recorder(
+        self, proc: subprocess.Popen, wav: str, generation: int
+    ) -> None:
+        while proc.poll() is None:
+            time.sleep(RECORDER_WATCH_POLL_SEC)
+        self._handle_recorder_exit(
+            proc,
+            wav,
+            generation,
+            self._recorder_exit_detail(proc),
+        )
+
+    def _handle_recorder_exit(
+        self,
+        proc: subprocess.Popen,
+        wav: str,
+        generation: int,
+        detail: str,
+    ) -> None:
+        """Replace a recorder only when it is still the active generation."""
+        watch: tuple[subprocess.Popen, str, int] | None = None
+        session: Path | None = None
+        with self._lock:
+            if (
+                not self._recording
+                or self._record_proc is not proc
+                or self._wav_path != wav
+                or self._record_generation != generation
+            ):
+                return
+
+            duration = time.monotonic() - self._record_start
+            seq = self._chunk_seq
+            self._chunk_seq += 1
+            session_id = self._session_id
+            session = self._session_paths.get(session_id)
+            self._record_proc = None
+            self._wav_path = None
+            self._cancel_max_timer()
+            print(
+                f"whisper-dictation: recorder exited during chunk {seq} "
+                f"after {duration:.2f}s ({detail}); reconnecting",
+                file=sys.stderr,
+            )
+
+            spawned = self._spawn_recorder()
+            if spawned is None:
+                self._recording = False
+                self._tray.set_recording(False)
+            else:
+                next_generation = self._activate_recorder_locked(spawned)
+                watch = (*spawned, next_generation)
+
+        if watch is not None:
+            self._start_recorder_watch(*watch)
+        self._stage_chunk(wav, duration, seq, session_id)
+        if watch is not None:
+            return
+
+        self._store.stop_session(session)
+        reason = self._last_recorder_error or detail
+        self._notify(f"Recorder unavailable — saved prior audio ({reason[:80]})")
+
     def _start_recording(self) -> None:
         started = False
         hold = False
+        watch: tuple[subprocess.Popen, str, int] | None = None
         with self._lock:
             if self._recording:
                 return
@@ -620,27 +791,34 @@ class Dictation:
                 return
             spawned = self._spawn_recorder()
             if spawned is None:
-                self._notify(f"{self._recorder[0]} not found")
+                reason = self._last_recorder_error or f"{self._recorder[0]} failed"
+                self._notify(f"Recorder unavailable: {reason[:100]}")
                 return
-            self._record_proc, self._wav_path = spawned
             self._recording = True
             now = time.monotonic()
-            self._record_start = now
             self._session_start = now
             self._session_id += 1
             self._active_session = self._store.start_session()
             self._session_paths[self._session_id] = self._active_session
             self._tray.set_recording(True)
-            self._arm_max_timer()
+            generation = self._activate_recorder_locked(spawned)
+            watch = (*spawned, generation)
             started = True
             hold = self.hotkey_mode != "toggle"
+        if watch is not None:
+            self._start_recorder_watch(*watch)
         if started:
             self._notify("Listening…" if hold else "Recording… (Ctrl+Space to stop)")
 
-    def _roll_recording(self) -> None:
-        """Keep listening: start the next slice, then transcribe the one that just filled."""
+    def _roll_recording(self, expected_generation: int | None = None) -> None:
+        """Release the filled recorder, then acquire and validate its successor."""
+        watch: tuple[subprocess.Popen, str, int] | None = None
+        session: Path | None = None
         with self._lock:
-            if not self._recording:
+            if not self._recording or (
+                expected_generation is not None
+                and expected_generation != self._record_generation
+            ):
                 return
             old_proc = self._record_proc
             old_wav = self._wav_path
@@ -648,21 +826,28 @@ class Dictation:
             seq = self._chunk_seq
             self._chunk_seq += 1
             session_id = self._session_id
+            session = self._session_paths.get(session_id)
+            self._record_proc = None
+            self._wav_path = None
+            self._cancel_max_timer()
+            graceful_stop_recorder(old_proc, old_wav, 0)
             spawned = self._spawn_recorder()
             if spawned is None:
                 self._recording = False
-                self._record_proc = None
-                self._wav_path = None
-                self._cancel_max_timer()
                 self._tray.set_recording(False)
             else:
-                self._record_proc, self._wav_path = spawned
-                self._record_start = time.monotonic()
-                self._arm_max_timer()
-        graceful_stop_recorder(old_proc, old_wav, self.recorder_stop_flush_msec)
+                next_generation = self._activate_recorder_locked(spawned)
+                watch = (*spawned, next_generation)
+
+        if watch is not None:
+            self._start_recorder_watch(*watch)
         self._stage_chunk(old_wav, duration, seq, session_id)
-        if spawned is None:
-            self._notify("Recorder died — finishing this utterance")
+        if watch is not None:
+            return
+
+        self._store.stop_session(session)
+        reason = self._last_recorder_error or "recorder start failed"
+        self._notify(f"Recorder unavailable — saved prior audio ({reason[:80]})")
 
     def _finish_recording(self) -> None:
         with self._lock:
@@ -689,22 +874,21 @@ class Dictation:
         session_id = job.paste_session
         listening = job.paste and self._recording and session_id == self._session_id
         self._store.begin(job)
-        wav_bytes = os.path.getsize(wav) if os.path.exists(wav) else 0
-        if wav_bytes < 1000:
-            err = ""
-            if not listening:
-                hint = "check mic in Settings → Sound → Input"
-                if self.audio_source:
-                    hint = f"mic: {self.audio_source[:40]}… — {hint}"
-                self._notify(f"Recording empty ({wav_bytes} B). {hint}. {err}")
-            status = "missing" if not os.path.exists(wav) else "no_text"
-            self._store.terminal(job, status, f"audio file is {wav_bytes} bytes")
-            return
-
         if duration < self.min_record:
             self._store.terminal(job, "ignored", "recording was too short")
             if not listening:
                 self._notify("Too short — speak longer, then Ctrl+Space to stop")
+            return
+
+        wav_bytes = os.path.getsize(wav) if os.path.exists(wav) else 0
+        if wav_bytes < MIN_USABLE_WAV_BYTES:
+            if not listening:
+                hint = "check mic in Settings → Sound → Input"
+                if self.audio_source:
+                    hint = f"mic: {self.audio_source[:40]}… — {hint}"
+                self._notify(f"Recording empty ({wav_bytes} B). {hint}.")
+            status = "missing" if not os.path.exists(wav) else "no_text"
+            self._store.terminal(job, status, f"audio file is {wav_bytes} bytes")
             return
 
         try:

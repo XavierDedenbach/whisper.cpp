@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -931,6 +933,101 @@ class HangRecoveryTests(unittest.TestCase):
                 finally:
                     app._cancel_max_timer()
 
+    def test_spawn_recorder_retries_early_exit_until_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            counter = root / "starts"
+            recorder = root / "recorder.py"
+            write_executable(
+                recorder,
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "counter = os.environ['FAKE_RECORDER_COUNTER']\n"
+                "try:\n"
+                "    count = int(open(counter, encoding='utf-8').read()) + 1\n"
+                "except FileNotFoundError:\n"
+                "    count = 1\n"
+                "open(counter, 'w', encoding='utf-8').write(str(count))\n"
+                "if count < 3:\n"
+                "    print('source acquire failed', file=sys.stderr)\n"
+                "    raise SystemExit(17)\n"
+                "with open(sys.argv[-1], 'wb') as output:\n"
+                "    output.write(b'R' * 2048)\n"
+                "while True:\n"
+                "    time.sleep(1)\n",
+            )
+            app = self._make_app()
+            app._recorder = [str(recorder)]
+            real_mkstemp = tempfile.mkstemp
+
+            def local_mkstemp(**kwargs):
+                return real_mkstemp(dir=root, **kwargs)
+
+            with mock.patch.dict(os.environ, {"FAKE_RECORDER_COUNTER": str(counter)}):
+                with mock.patch("dictation.wake_audio_source"):
+                    with mock.patch(
+                        "dictation.tempfile.mkstemp", side_effect=local_mkstemp
+                    ):
+                        with mock.patch("dictation.RECORDER_START_TIMEOUT_SEC", 0.2):
+                            with mock.patch("dictation.RECORDER_RETRY_DELAY_SEC", 0):
+                                spawned = app._spawn_recorder()
+
+            self.assertIsNotNone(spawned)
+            proc, wav = spawned
+            try:
+                self.assertIsNone(proc.poll())
+                self.assertGreaterEqual(Path(wav).stat().st_size, 1000)
+                self.assertEqual(counter.read_text(encoding="utf-8"), "3")
+                self.assertEqual(
+                    list(root.glob("whisper-dictation-*.wav")), [Path(wav)]
+                )
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                app._recorder_exit_detail(proc)
+
+    def test_spawn_recorder_rejects_live_child_without_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            recorder = root / "recorder.py"
+            write_executable(
+                recorder,
+                "#!/usr/bin/env python3\nimport time\ntime.sleep(5)\n",
+            )
+            app = self._make_app()
+            app._recorder = [str(recorder)]
+            real_mkstemp = tempfile.mkstemp
+
+            def local_mkstemp(**kwargs):
+                return real_mkstemp(dir=root, **kwargs)
+
+            with mock.patch("dictation.wake_audio_source"):
+                with mock.patch(
+                    "dictation.tempfile.mkstemp", side_effect=local_mkstemp
+                ):
+                    with mock.patch("dictation.RECORDER_START_ATTEMPTS", 2):
+                        with mock.patch("dictation.RECORDER_START_TIMEOUT_SEC", 0.05):
+                            with mock.patch("dictation.RECORDER_RETRY_DELAY_SEC", 0):
+                                spawned = app._spawn_recorder()
+
+            self.assertIsNone(spawned)
+            self.assertEqual(list(root.glob("whisper-dictation-*.wav")), [])
+            self.assertIn("no audio payload", app._last_recorder_error)
+
+    def test_stop_tolerates_recorder_exiting_before_signal(self) -> None:
+        from dictation import graceful_stop_recorder
+
+        proc = mock.Mock(pid=123)
+        proc.poll.return_value = None
+        proc.send_signal.side_effect = ProcessLookupError
+        proc.wait.return_value = 0
+        with mock.patch("dictation.os.getpgid", side_effect=ProcessLookupError):
+            graceful_stop_recorder(proc, None, 0)
+        proc.wait.assert_called_once_with(timeout=5.0)
+
     def test_prefix_chunk_for_insert_adds_single_space(self) -> None:
         from dictation import prefix_chunk_for_insert
 
@@ -947,7 +1044,7 @@ class HangRecoveryTests(unittest.TestCase):
         self.assertEqual(empty, "")
         self.assertTrue(need)
 
-    def test_roll_starts_next_recorder_and_stages_old_wav(self) -> None:
+    def test_roll_releases_old_before_starting_next_recorder(self) -> None:
         app = self._make_app()
         old_proc = mock.Mock()
         new_proc = mock.Mock()
@@ -957,21 +1054,465 @@ class HangRecoveryTests(unittest.TestCase):
         app._wav_path = "/tmp/old.wav"
         app._record_start = time.monotonic() - 45
         app._tray = mock.Mock()
-        with mock.patch.object(
-            app, "_spawn_recorder", return_value=(new_proc, "/tmp/new.wav")
-        ):
-            with mock.patch("dictation.graceful_stop_recorder") as stop:
-                with mock.patch.object(app, "_stage_chunk") as stage:
-                    app._roll_recording()
+        events = []
+
+        def spawn():
+            events.append("spawn-next")
+            return new_proc, "/tmp/new.wav"
+
+        def stop(*_args):
+            events.append("stop-old")
+
+        def stage(*_args):
+            events.append("stage-old")
+
+        def watch(*_args):
+            events.append("watch-next")
+
+        with mock.patch.object(app, "_spawn_recorder", side_effect=spawn):
+            with mock.patch(
+                "dictation.graceful_stop_recorder", side_effect=stop
+            ) as stop_call:
+                with mock.patch.object(
+                    app, "_stage_chunk", side_effect=stage
+                ) as stage_call:
+                    with mock.patch.object(
+                        app, "_start_recorder_watch", side_effect=watch
+                    ):
+                        with mock.patch.object(app, "_arm_max_timer"):
+                            app._roll_recording()
         self.assertTrue(app._recording)
         self.assertIs(app._record_proc, new_proc)
         self.assertEqual(app._wav_path, "/tmp/new.wav")
-        stop.assert_called_once()
-        self.assertIs(stop.call_args[0][0], old_proc)
-        self.assertEqual(stop.call_args[0][1], "/tmp/old.wav")
+        self.assertEqual(events, ["stop-old", "spawn-next", "watch-next", "stage-old"])
+        stop_call.assert_called_once()
+        self.assertIs(stop_call.call_args[0][0], old_proc)
+        self.assertEqual(stop_call.call_args[0][1], "/tmp/old.wav")
+        self.assertEqual(stop_call.call_args[0][2], 0)
+        stage_call.assert_called_once()
+        self.assertEqual(stage_call.call_args[0][0], "/tmp/old.wav")
+        self.assertEqual(stage_call.call_args[0][3], 7)
+
+    def test_unexpected_recorder_exit_restarts_and_stages_partial_chunk(self) -> None:
+        app = self._make_app()
+        old_proc = mock.Mock()
+        new_proc = mock.Mock()
+        app._recording = True
+        app._record_proc = old_proc
+        app._wav_path = "/tmp/partial.wav"
+        app._record_start = time.monotonic() - 3
+        app._record_generation = 4
+        app._session_id = 7
+        app._session_paths = {7: Path("/tmp/session")}
+        app._tray = mock.Mock()
+        with mock.patch.object(
+            app, "_spawn_recorder", return_value=(new_proc, "/tmp/recovered.wav")
+        ):
+            with mock.patch.object(app, "_stage_chunk") as stage:
+                with mock.patch.object(app, "_start_recorder_watch", create=True):
+                    with mock.patch.object(app, "_arm_max_timer"):
+                        app._handle_recorder_exit(
+                            old_proc,
+                            "/tmp/partial.wav",
+                            4,
+                            "exit 17: acquire failed",
+                        )
+
+        self.assertTrue(app._recording)
+        self.assertIs(app._record_proc, new_proc)
+        self.assertEqual(app._wav_path, "/tmp/recovered.wav")
         stage.assert_called_once()
-        self.assertEqual(stage.call_args[0][0], "/tmp/old.wav")
-        self.assertEqual(stage.call_args[0][3], 7)
+        self.assertEqual(stage.call_args.args[0], "/tmp/partial.wav")
+        self.assertEqual(stage.call_args.args[2:], (0, 7))
+
+    def test_empty_failed_chunk_keeps_later_audio_in_transcript(self) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with mock.patch.object(Dictation, "_transcribe_worker"):
+                app = self._make_app()
+            app._store = SessionStore(root / "sessions")
+            session = app._store.start_session()
+            empty_partial = root / "empty-partial.wav"
+            recovered_audio = root / "recovered.wav"
+            empty_partial.write_bytes(b"")
+            recovered_audio.write_bytes(b"R" * 2048)
+            failed_proc = mock.Mock()
+            recovered_proc = mock.Mock()
+            following_proc = mock.Mock()
+            app._recording = True
+            app._record_proc = failed_proc
+            app._wav_path = str(empty_partial)
+            app._record_start = time.monotonic() - 2
+            app._record_generation = 3
+            app._session_id = 11
+            app._session_paths = {11: session}
+            app._tray = mock.Mock()
+            jobs = []
+
+            def capture_job(_seq, job):
+                jobs.append(job)
+
+            with mock.patch.object(
+                app,
+                "_spawn_recorder",
+                side_effect=[
+                    (recovered_proc, str(recovered_audio)),
+                    (following_proc, str(root / "following.wav")),
+                ],
+            ):
+                with mock.patch.object(
+                    app, "_submit_in_order", side_effect=capture_job
+                ):
+                    with mock.patch.object(app, "_start_recorder_watch"):
+                        with mock.patch.object(app, "_arm_max_timer"):
+                            with mock.patch("dictation.graceful_stop_recorder"):
+                                app._handle_recorder_exit(
+                                    failed_proc,
+                                    str(empty_partial),
+                                    3,
+                                    "exit 17: injected",
+                                )
+                                app._record_start = time.monotonic() - 2
+                                app._roll_recording()
+
+            self.assertEqual([job.chunk_index for job in jobs], [0, 1])
+            with mock.patch.object(app, "_notify"):
+                app._deliver_chunk(jobs[0])
+                with mock.patch("dictation.wav_rms", return_value=400):
+                    with mock.patch.object(
+                        app, "_transcribe", return_value="words after recovery"
+                    ):
+                        with mock.patch.object(app, "_insert_chunk"):
+                            app._deliver_chunk(jobs[1])
+            app._store.stop_session(session)
+            transcript = (session / "transcript.txt").read_text(encoding="utf-8")
+            self.assertIn("[no_text: chunk 0000", transcript)
+            self.assertTrue(transcript.endswith("words after recovery\n"))
+
+    def test_recorder_watch_routes_exit_to_expected_generation(self) -> None:
+        app = self._make_app()
+        proc = mock.Mock()
+        proc.poll.side_effect = [None, 17]
+        with mock.patch("dictation.time.sleep"):
+            with mock.patch.object(
+                app, "_recorder_exit_detail", return_value="exit 17"
+            ):
+                with mock.patch.object(app, "_handle_recorder_exit") as handle:
+                    app._watch_recorder(proc, "/tmp/partial.wav", 4)
+        handle.assert_called_once_with(proc, "/tmp/partial.wav", 4, "exit 17")
+
+    def test_stale_watcher_and_timer_cannot_rotate_current_recorder(self) -> None:
+        app = self._make_app()
+        stale_proc = mock.Mock()
+        current_proc = mock.Mock()
+        app._recording = True
+        app._record_proc = current_proc
+        app._wav_path = "/tmp/current.wav"
+        app._record_generation = 8
+        with mock.patch.object(app, "_spawn_recorder") as spawn:
+            with mock.patch.object(app, "_stage_chunk") as stage:
+                app._handle_recorder_exit(stale_proc, "/tmp/stale.wav", 7, "exit 1")
+        spawn.assert_not_called()
+        stage.assert_not_called()
+        with mock.patch.object(app, "_roll_recording") as roll:
+            app._on_max_record(7)
+        roll.assert_not_called()
+
+    def test_rollover_wins_watcher_race_without_duplicate_stage_or_spawn(self) -> None:
+        app = self._make_app()
+        old_proc = mock.Mock()
+        new_proc = mock.Mock()
+        app._recording = True
+        app._record_proc = old_proc
+        app._wav_path = "/tmp/old.wav"
+        app._record_start = time.monotonic() - 45
+        app._record_generation = 1
+        app._session_id = 5
+        app._tray = mock.Mock()
+        stop_entered = threading.Event()
+        release_stop = threading.Event()
+        watcher_attempted = threading.Event()
+
+        def stop(*_args):
+            stop_entered.set()
+            release_stop.wait(timeout=2)
+
+        def watcher():
+            watcher_attempted.set()
+            app._handle_recorder_exit(old_proc, "/tmp/old.wav", 1, "exit 17")
+
+        with mock.patch.object(
+            app, "_spawn_recorder", return_value=(new_proc, "/tmp/new.wav")
+        ) as spawn:
+            with mock.patch("dictation.graceful_stop_recorder", side_effect=stop):
+                with mock.patch.object(app, "_stage_chunk") as stage:
+                    with mock.patch.object(app, "_start_recorder_watch"):
+                        with mock.patch.object(app, "_arm_max_timer"):
+                            roll_thread = threading.Thread(target=app._roll_recording)
+                            roll_thread.start()
+                            self.assertTrue(stop_entered.wait(timeout=1))
+                            watcher_thread = threading.Thread(target=watcher)
+                            watcher_thread.start()
+                            self.assertTrue(watcher_attempted.wait(timeout=1))
+                            time.sleep(0.02)
+                            self.assertTrue(watcher_thread.is_alive())
+                            release_stop.set()
+                            roll_thread.join(timeout=2)
+                            watcher_thread.join(timeout=2)
+
+        self.assertFalse(roll_thread.is_alive())
+        self.assertFalse(watcher_thread.is_alive())
+        spawn.assert_called_once_with()
+        stage.assert_called_once()
+        self.assertEqual(stage.call_args.args[2:], (0, 5))
+        self.assertIs(app._record_proc, new_proc)
+        self.assertEqual(app._record_generation, 2)
+
+    def test_watcher_wins_timer_race_and_stale_timer_does_not_roll(self) -> None:
+        app = self._make_app()
+        old_proc = mock.Mock()
+        new_proc = mock.Mock()
+        app._recording = True
+        app._record_proc = old_proc
+        app._wav_path = "/tmp/old.wav"
+        app._record_start = time.monotonic() - 2
+        app._record_generation = 1
+        app._session_id = 5
+        app._tray = mock.Mock()
+        spawn_entered = threading.Event()
+        release_spawn = threading.Event()
+        timer_attempted = threading.Event()
+
+        def spawn():
+            spawn_entered.set()
+            release_spawn.wait(timeout=2)
+            return new_proc, "/tmp/new.wav"
+
+        def timer():
+            timer_attempted.set()
+            app._on_max_record(1)
+
+        with mock.patch.object(app, "_spawn_recorder", side_effect=spawn) as spawn_call:
+            with mock.patch.object(app, "_stage_chunk") as stage:
+                with mock.patch.object(app, "_start_recorder_watch"):
+                    with mock.patch.object(app, "_arm_max_timer"):
+                        with mock.patch.object(app, "_roll_recording") as roll:
+                            watcher_thread = threading.Thread(
+                                target=app._handle_recorder_exit,
+                                args=(old_proc, "/tmp/old.wav", 1, "exit 17"),
+                            )
+                            watcher_thread.start()
+                            self.assertTrue(spawn_entered.wait(timeout=1))
+                            timer_thread = threading.Thread(target=timer)
+                            timer_thread.start()
+                            self.assertTrue(timer_attempted.wait(timeout=1))
+                            time.sleep(0.02)
+                            self.assertTrue(timer_thread.is_alive())
+                            release_spawn.set()
+                            watcher_thread.join(timeout=2)
+                            timer_thread.join(timeout=2)
+
+        self.assertFalse(watcher_thread.is_alive())
+        self.assertFalse(timer_thread.is_alive())
+        spawn_call.assert_called_once_with()
+        stage.assert_called_once()
+        roll.assert_not_called()
+        self.assertIs(app._record_proc, new_proc)
+        self.assertEqual(app._record_generation, 2)
+
+    def test_user_stop_wins_watcher_race_without_reconnecting(self) -> None:
+        app = self._make_app()
+        proc = mock.Mock()
+        app._recording = True
+        app._record_proc = proc
+        app._wav_path = "/tmp/final.wav"
+        app._record_start = time.monotonic() - 2
+        app._record_generation = 1
+        app._session_id = 5
+        app._tray = mock.Mock()
+        stop_entered = threading.Event()
+        release_stop = threading.Event()
+
+        def stop(*_args):
+            stop_entered.set()
+            release_stop.wait(timeout=2)
+
+        with mock.patch.object(app, "_spawn_recorder") as spawn:
+            with mock.patch("dictation.graceful_stop_recorder", side_effect=stop):
+                with mock.patch.object(app, "_stage_chunk") as stage:
+                    finish_thread = threading.Thread(target=app._finish_recording)
+                    finish_thread.start()
+                    self.assertTrue(stop_entered.wait(timeout=1))
+                    watcher_thread = threading.Thread(
+                        target=app._handle_recorder_exit,
+                        args=(proc, "/tmp/final.wav", 1, "exit 17"),
+                    )
+                    watcher_thread.start()
+                    watcher_thread.join(timeout=1)
+                    self.assertFalse(watcher_thread.is_alive())
+                    release_stop.set()
+                    finish_thread.join(timeout=2)
+
+        self.assertFalse(finish_thread.is_alive())
+        spawn.assert_not_called()
+        stage.assert_called_once()
+        self.assertEqual(stage.call_args.args[2:], (0, 5))
+        self.assertFalse(app._recording)
+
+    def test_watcher_wins_user_stop_race_then_stop_closes_replacement(self) -> None:
+        app = self._make_app()
+        failed_proc = mock.Mock()
+        replacement_proc = mock.Mock()
+        app._recording = True
+        app._record_proc = failed_proc
+        app._wav_path = "/tmp/failed.wav"
+        app._record_start = time.monotonic() - 2
+        app._record_generation = 1
+        app._session_id = 5
+        app._tray = mock.Mock()
+        spawn_entered = threading.Event()
+        release_spawn = threading.Event()
+        stop_attempted = threading.Event()
+
+        def spawn():
+            spawn_entered.set()
+            release_spawn.wait(timeout=2)
+            return replacement_proc, "/tmp/replacement.wav"
+
+        def finish():
+            stop_attempted.set()
+            app._finish_recording()
+
+        with mock.patch.object(app, "_spawn_recorder", side_effect=spawn) as spawn_call:
+            with mock.patch("dictation.graceful_stop_recorder") as stop:
+                with mock.patch.object(app, "_stage_chunk") as stage:
+                    with mock.patch.object(app, "_start_recorder_watch"):
+                        with mock.patch.object(app, "_arm_max_timer"):
+                            watcher_thread = threading.Thread(
+                                target=app._handle_recorder_exit,
+                                args=(failed_proc, "/tmp/failed.wav", 1, "exit 17"),
+                            )
+                            watcher_thread.start()
+                            self.assertTrue(spawn_entered.wait(timeout=1))
+                            finish_thread = threading.Thread(target=finish)
+                            finish_thread.start()
+                            self.assertTrue(stop_attempted.wait(timeout=1))
+                            time.sleep(0.02)
+                            self.assertTrue(finish_thread.is_alive())
+                            release_spawn.set()
+                            watcher_thread.join(timeout=2)
+                            finish_thread.join(timeout=2)
+
+        self.assertFalse(watcher_thread.is_alive())
+        self.assertFalse(finish_thread.is_alive())
+        spawn_call.assert_called_once_with()
+        stop.assert_called_once()
+        self.assertIs(stop.call_args.args[0], replacement_proc)
+        self.assertEqual(sorted(call.args[2] for call in stage.call_args_list), [0, 1])
+        self.assertFalse(app._recording)
+
+    def test_failure_at_second_third_or_later_recorder_keeps_rotating(self) -> None:
+        for failed_index in (1, 2, 7, 15):
+            with self.subTest(failed_index=failed_index):
+                app = self._make_app()
+                app._recording = True
+                app._record_proc = mock.Mock(name="recorder-0")
+                app._wav_path = "/tmp/chunk-0.wav"
+                app._record_start = time.monotonic() - 1
+                app._record_generation = 1
+                app._session_id = 9
+                app._session_paths = {9: Path("/tmp/session")}
+                app._tray = mock.Mock()
+                next_index = 1
+
+                def spawn():
+                    nonlocal next_index
+                    proc = mock.Mock(name=f"recorder-{next_index}")
+                    wav = f"/tmp/chunk-{next_index}.wav"
+                    next_index += 1
+                    return proc, wav
+
+                staged = []
+
+                def stage(wav, _duration, seq, session_id):
+                    staged.append((seq, wav, session_id))
+
+                with mock.patch.object(app, "_spawn_recorder", side_effect=spawn):
+                    with mock.patch.object(app, "_stage_chunk", side_effect=stage):
+                        with mock.patch.object(
+                            app, "_start_recorder_watch", create=True
+                        ):
+                            with mock.patch.object(app, "_arm_max_timer"):
+                                with mock.patch("dictation.graceful_stop_recorder"):
+                                    for index in range(16):
+                                        if index == failed_index:
+                                            app._handle_recorder_exit(
+                                                app._record_proc,
+                                                app._wav_path,
+                                                app._record_generation,
+                                                "exit 17: injected",
+                                            )
+                                        else:
+                                            app._roll_recording()
+
+                self.assertTrue(app._recording)
+                self.assertEqual([item[0] for item in staged], list(range(16)))
+                self.assertEqual(len({item[0] for item in staged}), 16)
+                self.assertTrue(all(item[2] == 9 for item in staged))
+
+    def test_roll_closes_session_after_all_successor_starts_fail(self) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with mock.patch.object(Dictation, "_transcribe_worker"):
+                app = self._make_app()
+            app._store = SessionStore(root / "sessions")
+            session = app._store.start_session()
+            wav = root / "last-good.wav"
+            wav.write_bytes(b"R" * 2048)
+            app._recording = True
+            app._record_proc = mock.Mock()
+            app._wav_path = str(wav)
+            app._record_start = time.monotonic() - 45
+            app._session_id = 3
+            app._session_paths = {3: session}
+            app._tray = mock.Mock()
+            app._last_recorder_error = "source acquire failed"
+            with mock.patch.object(app, "_spawn_recorder", return_value=None):
+                with mock.patch("dictation.graceful_stop_recorder"):
+                    with mock.patch.object(app, "_notify"):
+                        app._roll_recording()
+
+            manifest = json.loads(
+                (session / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(app._recording)
+            self.assertFalse(manifest["recording"])
+            self.assertEqual(
+                [(chunk["index"], chunk["status"]) for chunk in manifest["chunks"]],
+                [(0, "queued")],
+            )
+            retained = session / manifest["chunks"][0]["wav"]
+            self.assertEqual(retained.read_bytes(), b"R" * 2048)
+
+    def test_short_empty_tail_is_not_reported_as_microphone_failure(self) -> None:
+        from session_store import ChunkJob
+
+        with tempfile.NamedTemporaryFile(suffix=".wav") as handle:
+            app = self._make_app()
+            app._store = mock.Mock()
+            app._recording = False
+            app._session_id = 1
+            app._notify = mock.Mock()
+            job = ChunkJob(Path(handle.name).parent, 0, Path(handle.name), 0.1, True, 1)
+            app._deliver_chunk(job)
+        app._store.terminal.assert_called_once_with(
+            job, "ignored", "recording was too short"
+        )
+        self.assertIn("Too short", app._notify.call_args.args[0])
 
     def test_user_stop_does_not_start_next_slice(self) -> None:
         app = self._make_app()
