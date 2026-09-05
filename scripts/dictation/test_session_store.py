@@ -34,6 +34,63 @@ class SessionStoreTests(unittest.TestCase):
             "hello world again. Next",
         )
 
+    def test_silent_tail_is_retained_without_polluting_transcript(self) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = SessionStore(root / "sessions")
+            session = store.start_session(capture_mode="continuous")
+            speech_source = root / "speech.wav"
+            write_wav(speech_source)
+            speech = store.ingest(session, 0, speech_source, 1.0)
+            silent_source = root / "silent.wav"
+            write_wav(silent_source)
+            silent = store.ingest(session, 1, silent_source, 1.0)
+            ignored_source = root / "ignored.wav"
+            write_wav(ignored_source)
+            ignored = store.ingest(session, 2, ignored_source, 1.0)
+            store.complete(speech, "complete thought")
+            store.terminal(silent, "silent", "RMS 0")
+            store.terminal(ignored, "ignored", "too short")
+
+            self.assertTrue(silent.wav_path.is_file())
+            self.assertTrue(ignored.wav_path.is_file())
+            self.assertEqual(
+                (session / "transcript.txt").read_text(encoding="utf-8"),
+                "complete thought\n",
+            )
+
+    def test_legacy_and_manifest_v1_silent_chunks_keep_markers(self) -> None:
+        from session_store import SessionStore
+
+        for manifest_version in (1, 2):
+            with self.subTest(manifest_version=manifest_version):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    store = SessionStore(root / "sessions")
+                    session = store.start_session()
+                    jobs = []
+                    for index in range(2):
+                        source = root / f"source-{index}.wav"
+                        write_wav(source)
+                        jobs.append(store.ingest(session, index, source, 1.0))
+                    if manifest_version == 1:
+                        manifest_path = session / "manifest.json"
+                        manifest = json.loads(manifest_path.read_text())
+                        manifest["version"] = 1
+                        manifest.pop("policy", None)
+                        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+                    store.terminal(jobs[0], "silent", "RMS 0")
+                    store.terminal(jobs[1], "ignored", "too short")
+
+                    self.assertEqual(
+                        (session / "transcript.txt").read_text(encoding="utf-8"),
+                        "[silent: chunk 0000 — RMS 0]\n"
+                        "[ignored: chunk 0001 — too short]\n",
+                    )
+
     def test_preserves_audio_and_rebuilds_ordered_transcript_after_failure(
         self,
     ) -> None:
@@ -96,6 +153,166 @@ class SessionStoreTests(unittest.TestCase):
             self.assertTrue(all(not job.paste for job in recovered))
             manifest = json.loads((session / "manifest.json").read_text())
             self.assertEqual(manifest["chunks"][3]["status"], "exhausted")
+
+    def test_manifest_v2_policy_survives_restart_recovery(self) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = SessionStore(root / "sessions")
+            session = store.start_session(
+                capture_mode="continuous",
+                beam_size=5,
+                audio_ctx=512,
+                trailing_silence_seconds=0.5,
+                minimum_audio_rms=93.0,
+            )
+            source = root / "source.wav"
+            write_wav(source)
+            store.ingest(session, 0, source, 8.0)
+
+            recovered = SessionStore(
+                root / "sessions", legacy_minimum_audio_rms=237.5
+            ).recoverable()
+
+            self.assertEqual(len(recovered), 1)
+            job = recovered[0]
+            self.assertEqual(job.capture_mode, "continuous")
+            self.assertEqual(job.beam_size, 5)
+            self.assertEqual(job.audio_ctx, 512)
+            self.assertEqual(job.trailing_silence_seconds, 0.5)
+            self.assertEqual(job.minimum_audio_rms, 93.0)
+            manifest = json.loads((session / "manifest.json").read_text())
+            self.assertEqual(manifest["version"], 2)
+
+    def test_manifest_v1_recovery_uses_legacy_policy_defaults(self) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = SessionStore(root / "sessions")
+            session = store.start_session()
+            source = root / "source.wav"
+            write_wav(source)
+            store.ingest(session, 0, source, 8.0)
+            manifest_path = session / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = 1
+            manifest.pop("policy", None)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            job = SessionStore(
+                root / "sessions", legacy_minimum_audio_rms=237.5
+            ).recoverable()[0]
+
+            self.assertEqual(job.capture_mode, "legacy")
+            self.assertIsNone(job.beam_size)
+            self.assertIsNone(job.audio_ctx)
+            self.assertEqual(job.trailing_silence_seconds, 0.0)
+            self.assertEqual(job.minimum_audio_rms, 237.5)
+
+    def test_default_recovery_is_exhaustive_beyond_one_hundred_chunks(self) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = SessionStore(root / "sessions")
+            session = store.start_session()
+            for index in range(105):
+                source = root / f"source-{index}.wav"
+                write_wav(source, frames=20)
+                store.ingest(session, index, source, 0.01)
+
+            recovered = store.recoverable()
+
+            self.assertEqual([job.chunk_index for job in recovered], list(range(105)))
+
+    def test_orphaned_committed_wav_is_reconciled_after_manifest_write_failure(
+        self,
+    ) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = SessionStore(root / "sessions")
+            session = store.start_session()
+            source = root / "source.wav"
+            write_wav(source)
+            with mock.patch.object(
+                store,
+                "_write_json",
+                side_effect=OSError("injected manifest failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "manifest failure"):
+                    store.ingest(session, 7, source, 0.1)
+
+            recovered = SessionStore(root / "sessions").recoverable()
+
+            self.assertEqual([job.chunk_index for job in recovered], [7])
+            self.assertTrue(recovered[0].wav_path.is_file())
+
+    def test_orphaned_committed_wav_is_reconciled_after_directory_fsync_failure(
+        self,
+    ) -> None:
+        from session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = SessionStore(root / "sessions")
+            session = store.start_session()
+            source = root / "source.wav"
+            write_wav(source)
+            with mock.patch.object(
+                store,
+                "_fsync_directory",
+                side_effect=OSError("injected directory failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "directory failure"):
+                    store.ingest(session, 9, source, 0.1)
+
+            recovered = SessionStore(root / "sessions").recoverable()
+
+            self.assertEqual([job.chunk_index for job in recovered], [9])
+            self.assertTrue(recovered[0].wav_path.is_file())
+
+    def test_repeated_retention_preserves_source_until_existing_wav_is_durable(
+        self,
+    ) -> None:
+        from session_store import SessionStore
+
+        for failure_site in ("file", "directory"):
+            with self.subTest(failure_site=failure_site):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    store = SessionStore(root / "sessions")
+                    session = store.start_session()
+                    original = root / "original.wav"
+                    write_wav(original)
+                    destination = store.retain_failed_ingest(session, 4, original)
+                    repeated = root / "repeated.wav"
+                    write_wav(repeated)
+
+                    if failure_site == "file":
+                        failure = mock.patch(
+                            "session_store.os.fsync",
+                            side_effect=OSError("injected retained WAV fsync failure"),
+                        )
+                    else:
+                        failure = mock.patch.object(
+                            store,
+                            "_fsync_directory",
+                            side_effect=OSError("injected session fsync failure"),
+                        )
+                    with failure:
+                        with self.assertRaisesRegex(OSError, "fsync failure"):
+                            store.retain_failed_ingest(session, 4, repeated)
+
+                    self.assertTrue(destination.is_file())
+                    self.assertTrue(repeated.is_file())
+                    self.assertEqual(
+                        store.retain_failed_ingest(session, 4, repeated), destination
+                    )
+                    self.assertFalse(repeated.exists())
 
     def test_recovered_chunk_updates_transcript_without_pasting(self) -> None:
         from dictation import Dictation

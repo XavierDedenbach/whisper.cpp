@@ -460,7 +460,9 @@ class RuntimeSelectionTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 env=env,
-                timeout=30,
+                # A loaded laptop can take over 30 seconds to initialize and run
+                # the real CPU small.en model used by this backend-rejection check.
+                timeout=60,
             )
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("selected binary did not report SYCL", result.stdout)
@@ -1315,6 +1317,66 @@ class HangRecoveryTests(unittest.TestCase):
         self.assertEqual(text, "recovered words")
         cmd = run.call_args_list[1].args[0]
         self.assertIn("beam_size=5", cmd)
+
+    def test_server_request_can_select_audio_context(self) -> None:
+        app = self._make_app()
+        which = subprocess.CompletedProcess(["which", "curl"], 0, "", "")
+        response = subprocess.CompletedProcess(
+            ["curl"], 0, '{"text":"fast accurate words"}', ""
+        )
+        with mock.patch(
+            "dictation.subprocess.run", side_effect=[which, response]
+        ) as run:
+            text = app._transcribe_server("/tmp/clip.wav", beam_size=5, audio_ctx=512)
+        self.assertEqual(text, "fast accurate words")
+        cmd = run.call_args_list[1].args[0]
+        self.assertIn("beam_size=5", cmd)
+        self.assertIn("audio_ctx=512", cmd)
+
+    def test_cli_request_can_select_audio_context(self) -> None:
+        app = self._make_app(WHISPER_BACKEND="cli")
+        response = subprocess.CompletedProcess(
+            ["whisper-cli"], 0, "fast accurate words", ""
+        )
+        with mock.patch("dictation.subprocess.run", return_value=response) as run:
+            text = app._transcribe_cli("/tmp/clip.wav", beam_size=5, audio_ctx=512)
+        self.assertEqual(text, "fast accurate words")
+        cmd = run.call_args.args[0]
+        self.assertIn("-bs", cmd)
+        self.assertEqual(cmd[cmd.index("-bs") + 1], "5")
+        self.assertIn("-ac", cmd)
+        self.assertEqual(cmd[cmd.index("-ac") + 1], "512")
+
+    def test_continuous_audio_context_must_cover_maximum_padded_chunk(self) -> None:
+        app = self._make_app(
+            CONTINUOUS_CAPTURE="1",
+            STREAM_SEGMENT_TARGET_SEC="8",
+            STREAM_SEGMENT_MIN_SEC="7",
+            STREAM_SEGMENT_MAX_SEC="9",
+            TRANSCRIPTION_TRAILING_SILENCE_SEC="0.5",
+            WHISPER_AUDIO_CTX="512",
+        )
+        self.assertEqual(app.audio_ctx, 512)
+
+        with self.assertRaisesRegex(ValueError, "WHISPER_AUDIO_CTX"):
+            self._make_app(
+                CONTINUOUS_CAPTURE="1",
+                STREAM_SEGMENT_TARGET_SEC="8",
+                STREAM_SEGMENT_MIN_SEC="7",
+                STREAM_SEGMENT_MAX_SEC="9",
+                TRANSCRIPTION_TRAILING_SILENCE_SEC="0.5",
+                WHISPER_AUDIO_CTX="474",
+            )
+
+    def test_reduced_audio_context_requires_continuous_capture(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "WHISPER_AUDIO_CTX requires CONTINUOUS_CAPTURE"
+        ):
+            self._make_app(
+                CONTINUOUS_CAPTURE="0",
+                MAX_RECORD_SEC="45",
+                WHISPER_AUDIO_CTX="512",
+            )
 
     def test_punctuation_only_retries_beam_on_same_server(self) -> None:
         for punctuation in (",", "()", "[]", "/", "¿?", "。", "،"):

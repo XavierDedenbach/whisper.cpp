@@ -16,6 +16,7 @@ import json
 import math
 import os
 import queue
+import select
 import signal
 import struct
 import subprocess
@@ -45,6 +46,12 @@ except ImportError:
 
 from dictation_indicator import TrayIndicator, tray_indicator_available  # noqa: E402
 from session_store import ChunkJob, SessionStore  # noqa: E402
+from temporal_audio import (  # noqa: E402
+    IncompletePcmSample,
+    PcmSegmenter,
+    prepared_padded_wav,
+    write_pcm_wav,
+)
 from vocab_prompt import (  # noqa: E402
     apply_replacements,
     build_whisper_prompt,
@@ -61,6 +68,7 @@ MODIFIER_KEYS = {
 # notify-send -r requires an integer replace id (a string is ignored / errors).
 NOTIFY_REPLACE_ID = "4242"
 SERVER_UNIT = "whisper-dictation-server.service"
+AUDIO_CONTEXT_TOKENS_PER_SECOND = 50
 MIN_USABLE_WAV_BYTES = 1000
 RECORDER_START_ATTEMPTS = 3
 RECORDER_START_TIMEOUT_SEC = 1.0
@@ -74,6 +82,7 @@ CLIPBOARD_KILL_TIMEOUT_SEC = 0.25
 XDOTOOL_TIMEOUT_SEC = 0.25
 TRAY_STOP_TIMEOUT_SEC = 0.5
 MAX_RECORDER_FLUSH_MSEC = 500.0
+RECORDER_STDERR_LIMIT_BYTES = 16 * 1024
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,53 @@ class SessionPasteJob:
 
     session_path: Path
     session_id: int
+
+
+class _BoundedStderrDrain:
+    """Continuously drain recorder stderr while retaining only its recent tail."""
+
+    def __init__(self, stream, limit: int = RECORDER_STDERR_LIMIT_BYTES) -> None:
+        self._stream = stream
+        self._limit = limit
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="whisper-recorder-stderr",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                try:
+                    payload = os.read(self._stream.fileno(), 4096)
+                except (OSError, ValueError):
+                    break
+                if not payload:
+                    break
+                with self._lock:
+                    self._buffer.extend(payload)
+                    overflow = len(self._buffer) - self._limit
+                    if overflow > 0:
+                        del self._buffer[:overflow]
+        finally:
+            try:
+                self._stream.close()
+            except (OSError, ValueError):
+                pass
+            self._done.set()
+
+    def text(self, *, wait: bool) -> str:
+        if wait:
+            self._done.wait(0.25)
+        with self._lock:
+            payload = bytes(self._buffer)
+        return payload.decode("utf-8", errors="replace").strip()
 
 
 def remaining_timeout(
@@ -146,6 +202,28 @@ def build_recorder_cmd(
             cmd.extend(["-D", source])
         return cmd
     return None
+
+
+def build_stream_recorder_cmd(
+    audio_source: str, cfg: dict[str, str] | None = None
+) -> list[str] | None:
+    """Build the opt-in single-owner raw PCM recorder command."""
+    cfg = cfg or {}
+    latency_msec = cfg.get("RECORDER_LATENCY_MSEC", "20").strip() or "20"
+    source = audio_source.strip()
+    if subprocess.run(["which", "parecord"], capture_output=True).returncode != 0:
+        return None
+    cmd = [
+        "parecord",
+        f"--latency-msec={latency_msec}",
+        "--rate=16000",
+        "--channels=1",
+        "--format=s16le",
+        "--raw",
+    ]
+    if source:
+        cmd.extend(["-d", source])
+    return cmd
 
 
 def wait_for_wav_stable(
@@ -425,6 +503,40 @@ class Dictation:
         self.language = cfg.get("WHISPER_LANGUAGE", "en").strip() or "en"
         self.suppress_nst = _truthy(cfg.get("WHISPER_SUPPRESS_NST", "1"))
         self.max_record = float(cfg.get("MAX_RECORD_SEC", "45"))
+        self.continuous_capture = _truthy(cfg.get("CONTINUOUS_CAPTURE", "0"))
+        self.stream_segment_target = float(cfg.get("STREAM_SEGMENT_TARGET_SEC", "8"))
+        self.stream_segment_minimum = float(cfg.get("STREAM_SEGMENT_MIN_SEC", "7"))
+        self.stream_segment_maximum = float(cfg.get("STREAM_SEGMENT_MAX_SEC", "9"))
+        self.trailing_silence_seconds = float(
+            cfg.get("TRANSCRIPTION_TRAILING_SILENCE_SEC", "0")
+        )
+        raw_beam_size = cfg.get("WHISPER_BEAM_SIZE", "").strip()
+        self.beam_size = int(raw_beam_size) if raw_beam_size else None
+        raw_audio_ctx = cfg.get("WHISPER_AUDIO_CTX", "").strip()
+        self.audio_ctx = int(raw_audio_ctx) if raw_audio_ctx else None
+        if self.beam_size is not None and self.beam_size <= 0:
+            raise ValueError("WHISPER_BEAM_SIZE must be a positive integer")
+        if self.audio_ctx is not None and self.audio_ctx <= 0:
+            raise ValueError("WHISPER_AUDIO_CTX must be a positive integer")
+        if self.audio_ctx is not None and not self.continuous_capture:
+            raise ValueError("WHISPER_AUDIO_CTX requires CONTINUOUS_CAPTURE=1")
+        if self.trailing_silence_seconds < 0:
+            raise ValueError("TRANSCRIPTION_TRAILING_SILENCE_SEC cannot be negative")
+        if self.continuous_capture:
+            PcmSegmenter(
+                target_seconds=self.stream_segment_target,
+                minimum_seconds=self.stream_segment_minimum,
+                maximum_seconds=self.stream_segment_maximum,
+            )
+            required_audio_ctx = math.ceil(
+                (self.stream_segment_maximum + self.trailing_silence_seconds)
+                * AUDIO_CONTEXT_TOKENS_PER_SECOND
+            )
+            if self.audio_ctx is not None and self.audio_ctx < required_audio_ctx:
+                raise ValueError(
+                    "WHISPER_AUDIO_CTX must cover the maximum padded chunk "
+                    f"(need at least {required_audio_ctx})"
+                )
         self.server_timeout = float(cfg.get("WHISPER_SERVER_TIMEOUT", "90"))
         self.cli_timeout = float(cfg.get("WHISPER_CLI_TIMEOUT", "90"))
         session_root = cfg.get(
@@ -432,7 +544,8 @@ class Dictation:
             "${HOME}/.local/share/whisper-dictation/sessions",
         )
         self._store = SessionStore(
-            Path(os.path.expanduser(os.path.expandvars(session_root)))
+            Path(os.path.expanduser(os.path.expandvars(session_root))),
+            legacy_minimum_audio_rms=self.min_audio_rms,
         )
 
         self._pressed: set = set()
@@ -453,6 +566,19 @@ class Dictation:
         self._clipboard_closed = threading.Event()
         self._max_timer: threading.Timer | None = None
         self._recorder = build_recorder_cmd(self.audio_source, cfg)
+        self._stream_recorder = (
+            build_stream_recorder_cmd(self.audio_source, cfg)
+            if self.continuous_capture
+            else None
+        )
+        self._stream_thread: threading.Thread | None = None
+        self._stream_done = threading.Event()
+        self._stream_stop_requested = threading.Event()
+        self._stream_input_bytes = 0
+        self._stream_output_bytes = 0
+        self._stream_input_sha256 = ""
+        self._stream_recorder_pids: list[int] = []
+        self._inference_timings: list[float] = []
         self._hotkey_chord_active = False  # ignore Space key-repeat until release
         self._hotkey_label_str = self._hotkey_label(cfg)
         self._notify_ms = int(
@@ -470,7 +596,7 @@ class Dictation:
         self._session_id = 0
         self._session_paths: dict[int, Path] = {}
         self._active_session: Path | None = None
-        for job in self._store.recoverable(limit=32):
+        for job in self._store.recoverable():
             self._chunk_queue.put(job)
         self._worker = threading.Thread(
             target=self._transcribe_worker, name="whisper-chunk-worker", daemon=True
@@ -547,7 +673,7 @@ class Dictation:
 
     def _arm_max_timer(self) -> None:
         self._cancel_max_timer()
-        if self.max_record <= 0:
+        if self.continuous_capture or self.max_record <= 0:
             return
         timer = threading.Timer(
             self.max_record,
@@ -566,6 +692,9 @@ class Dictation:
 
     @staticmethod
     def _read_recorder_stderr(proc: subprocess.Popen) -> str:
+        capture = getattr(proc, "_whisper_stderr_capture", None)
+        if isinstance(capture, _BoundedStderrDrain):
+            return capture.text(wait=proc.poll() is not None)
         stream = getattr(proc, "stderr", None)
         if stream is None:
             return ""
@@ -587,8 +716,17 @@ class Dictation:
         detail = f"exit {code}" if code is not None else "no audio payload"
         stderr = self._read_recorder_stderr(proc)
         if stderr:
-            detail += f": {' '.join(stderr.split())[:200]}"
+            detail += f": {' '.join(stderr.split())[-200:]}"
         return detail
+
+    @staticmethod
+    def _start_recorder_stderr_drain(proc: subprocess.Popen) -> None:
+        stream = getattr(proc, "stderr", None)
+        if stream is None:
+            return
+        capture = _BoundedStderrDrain(stream)
+        setattr(proc, "_whisper_stderr_capture", capture)
+        capture.start()
 
     def _wait_for_recorder_ready(
         self, proc: subprocess.Popen, path: str
@@ -622,24 +760,28 @@ class Dictation:
         )
 
     @staticmethod
-    def _reap_rejected_recorder(proc: subprocess.Popen, path: str) -> None:
+    def _reap_rejected_recorder(proc: subprocess.Popen, path: str | None) -> None:
         """Retain an unreaped startup child and its WAV until wait completes."""
         try:
             proc.wait()
         except (ChildProcessError, OSError):
             return
-        stream = getattr(proc, "stderr", None)
-        if stream is not None:
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(proc, stream_name, None)
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        if path is not None:
             try:
-                stream.close()
-            except (OSError, ValueError):
+                os.unlink(path)
+            except FileNotFoundError:
                 pass
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
 
-    def _retain_rejected_recorder(self, proc: subprocess.Popen, path: str) -> None:
+    def _retain_rejected_recorder(
+        self, proc: subprocess.Popen, path: str | None
+    ) -> None:
         with self._rejected_recorder_lock:
             self._unreaped_rejected_recorders += 1
 
@@ -677,6 +819,7 @@ class Dictation:
                     stderr=subprocess.PIPE,
                     start_new_session=True,
                 )
+                self._start_recorder_stderr_drain(proc)
             except OSError as exc:
                 self._last_recorder_error = str(exc)
                 os.unlink(path)
@@ -709,6 +852,378 @@ class Dictation:
                 time.sleep(RECORDER_RETRY_DELAY_SEC)
         return None
 
+    def _spawn_stream_recorder(
+        self,
+    ) -> tuple[subprocess.Popen, bytes] | None:
+        """Start one raw recorder and retain the bytes used for readiness."""
+        if not self._stream_recorder:
+            self._last_recorder_error = (
+                "continuous capture requires parecord; disable CONTINUOUS_CAPTURE "
+                "or install pulseaudio-utils"
+            )
+            return None
+        wake_audio_source(self.audio_source)
+        self._last_recorder_error = ""
+        for attempt in range(1, RECORDER_START_ATTEMPTS + 1):
+            try:
+                proc = subprocess.Popen(
+                    self._stream_recorder,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                self._start_recorder_stderr_drain(proc)
+            except OSError as exc:
+                self._last_recorder_error = str(exc)
+                break
+            if proc.stdout is None:
+                self._last_recorder_error = "raw recorder stdout pipe is unavailable"
+                reaped = graceful_stop_recorder(proc, None, 0, wait_timeout=0.5)
+                if not reaped:
+                    self._retain_rejected_recorder(proc, None)
+                break
+
+            deadline = time.monotonic() + RECORDER_START_TIMEOUT_SEC
+            initial = b""
+            while time.monotonic() < deadline:
+                try:
+                    readable, _, _ = select.select(
+                        [proc.stdout], [], [], min(0.05, deadline - time.monotonic())
+                    )
+                except (OSError, ValueError) as exc:
+                    self._last_recorder_error = str(exc)
+                    break
+                if readable:
+                    try:
+                        initial = os.read(proc.stdout.fileno(), 64 * 1024)
+                    except OSError as exc:
+                        self._last_recorder_error = str(exc)
+                        break
+                    if initial:
+                        self._stream_recorder_pids.append(proc.pid)
+                        if attempt > 1:
+                            print(
+                                "whisper-dictation: continuous recorder recovered "
+                                f"on startup attempt {attempt}",
+                                file=sys.stderr,
+                            )
+                        return proc, initial
+                if proc.poll() is not None:
+                    break
+
+            if not self._last_recorder_error:
+                self._last_recorder_error = (
+                    self._recorder_exit_detail(proc)
+                    if proc.poll() is not None
+                    else "no audio payload"
+                )
+            reaped = graceful_stop_recorder(proc, None, 0, wait_timeout=0.5)
+            print(
+                f"whisper-dictation: continuous recorder start attempt {attempt}/"
+                f"{RECORDER_START_ATTEMPTS} failed: {self._last_recorder_error}",
+                file=sys.stderr,
+            )
+            if not reaped:
+                self._retain_rejected_recorder(proc, None)
+                break
+            if attempt < RECORDER_START_ATTEMPTS and RECORDER_RETRY_DELAY_SEC > 0:
+                time.sleep(RECORDER_RETRY_DELAY_SEC)
+        return None
+
+    def _start_stream_recording(self) -> None:
+        started = False
+        hold = False
+        with self._lock:
+            if (
+                self._shutdown_deadline is not None
+                or self._recording
+                or self._record_proc is not None
+                or self._rejected_recorder_pending()
+            ):
+                return
+            if not self.cli.is_file():
+                self._notify(
+                    f"Missing {self.cli.name}; run scripts/dictation/install.sh"
+                )
+                return
+            if not self.model.is_file():
+                self._notify(f"Missing model {self.model.name}")
+                return
+            spawned = self._spawn_stream_recorder()
+            if spawned is None:
+                reason = self._last_recorder_error or "continuous recorder failed"
+                self._notify(f"Recorder unavailable: {reason[:100]}")
+                return
+            proc, initial = spawned
+            now = time.monotonic()
+            self._session_start = now
+            self._record_start = now
+            self._session_id += 1
+            try:
+                self._active_session = self._store.start_session(
+                    capture_mode="continuous",
+                    beam_size=self.beam_size,
+                    audio_ctx=self.audio_ctx,
+                    trailing_silence_seconds=self.trailing_silence_seconds,
+                    minimum_audio_rms=self.min_audio_rms,
+                )
+            except Exception as exc:
+                graceful_stop_recorder(proc, None, 0, wait_timeout=0.5)
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+                self._notify(f"Could not create durable session: {str(exc)[:80]}")
+                return
+            self._recording = True
+            self._session_paths[self._session_id] = self._active_session
+            self._record_proc = proc
+            self._wav_path = None
+            self._record_generation += 1
+            generation = self._record_generation
+            session_id = self._session_id
+            self._stream_done.clear()
+            self._stream_stop_requested.clear()
+            self._stream_input_bytes = 0
+            self._stream_output_bytes = 0
+            self._stream_input_sha256 = ""
+            self._tray.set_recording(True)
+            self._stream_thread = threading.Thread(
+                target=self._consume_stream,
+                args=(proc, initial, generation, session_id),
+                name=f"whisper-stream-{generation}",
+                daemon=True,
+            )
+            self._stream_thread.start()
+            started = True
+            hold = self.hotkey_mode != "toggle"
+        if started:
+            self._notify("Listening…" if hold else "Recording… (Ctrl+Space to stop)")
+
+    def _next_stream_sequence(self) -> int:
+        with self._lock:
+            sequence = self._chunk_seq
+            self._chunk_seq += 1
+            return sequence
+
+    def _stage_stream_pcm(
+        self,
+        pcm: bytes,
+        session_id: int,
+        *,
+        finalize: bool = False,
+    ) -> None:
+        if not pcm:
+            return
+        sequence = self._next_stream_sequence()
+        duration = len(pcm) / (16000 * 2)
+        path: Path | None = None
+        persisted = False
+        wav_ready = False
+        try:
+            try:
+                fd, name = tempfile.mkstemp(suffix=".wav", prefix="whisper-stream-")
+                os.close(fd)
+                path = Path(name)
+                write_pcm_wav(path, pcm)
+                wav_ready = True
+            except Exception as exc:
+                self._record_stream_gap(
+                    session_id,
+                    sequence,
+                    duration,
+                    str(exc),
+                    finalize=finalize,
+                )
+                return
+            persisted = self._stage_chunk(
+                str(path),
+                duration,
+                sequence,
+                session_id,
+                finalize=finalize,
+            )
+        finally:
+            if path is not None and (persisted or not wav_ready):
+                path.unlink(missing_ok=True)
+            elif path is not None and path.exists():
+                session = self._session_paths.get(session_id)
+                if session is not None:
+                    try:
+                        retained = self._store.retain_failed_ingest(
+                            session, sequence, path
+                        )
+                        print(
+                            "whisper-dictation: retained unmanifested audio for "
+                            f"recovery at {retained}",
+                            file=sys.stderr,
+                        )
+                    except OSError as exc:
+                        print(
+                            "whisper-dictation: could not move failed chunk into "
+                            f"session; retained at {path}: {exc}",
+                            file=sys.stderr,
+                        )
+
+    def _record_stream_gap(
+        self,
+        session_id: int,
+        sequence: int,
+        duration: float,
+        detail: str,
+        *,
+        finalize: bool,
+    ) -> None:
+        session = self._session_paths.get(session_id)
+        if session is not None:
+            try:
+                self._store.record_gap(session, sequence, duration, detail)
+            except Exception as exc:
+                print(
+                    f"whisper-dictation: could not retain stream gap marker: {exc}",
+                    file=sys.stderr,
+                )
+        marker = (
+            SessionPasteJob(session, session_id)
+            if session is not None and finalize
+            else None
+        )
+        self._submit_in_order(sequence, marker)
+
+    def _stage_stream_marker(self, session_id: int) -> None:
+        sequence = self._next_stream_sequence()
+        self._stage_chunk(None, 0.0, sequence, session_id, finalize=True)
+
+    def _stage_stream_gap_marker(self, session_id: int, detail: str) -> None:
+        sequence = self._next_stream_sequence()
+        self._record_stream_gap(session_id, sequence, 0.0, detail, finalize=True)
+
+    def _consume_stream(
+        self,
+        proc: subprocess.Popen,
+        initial: bytes,
+        generation: int,
+        session_id: int,
+    ) -> None:
+        """Own every recorder byte through EOF and finalize the session once."""
+        segmenter = PcmSegmenter(
+            target_seconds=self.stream_segment_target,
+            minimum_seconds=self.stream_segment_minimum,
+            maximum_seconds=self.stream_segment_maximum,
+        )
+        error = ""
+        try:
+            for pcm in segmenter.feed(initial):
+                self._stage_stream_pcm(pcm, session_id)
+            stream = proc.stdout
+            if stream is None:
+                raise RuntimeError("raw recorder stdout pipe disappeared")
+            while True:
+                data = stream.read(64 * 1024)
+                if not data:
+                    break
+                for pcm in segmenter.feed(data):
+                    self._stage_stream_pcm(pcm, session_id)
+            final_chunks = segmenter.finish()
+            for index, pcm in enumerate(final_chunks):
+                self._stage_stream_pcm(
+                    pcm,
+                    session_id,
+                    finalize=index == len(final_chunks) - 1,
+                )
+            if not final_chunks:
+                self._stage_stream_marker(session_id)
+        except IncompletePcmSample as exc:
+            error = str(exc)
+            aligned = segmenter.recover_aligned_tail()
+            if aligned:
+                self._stage_stream_pcm(aligned, session_id)
+            session = self._session_paths.get(session_id)
+            if session is not None and segmenter.unaligned_tail:
+                try:
+                    self._store.retain_capture_tail(
+                        session, segmenter.unaligned_tail, error
+                    )
+                except Exception as retain_exc:
+                    error = f"{error}; could not retain final byte: {retain_exc}"
+            self._stage_stream_gap_marker(session_id, error)
+        except Exception as exc:
+            error = str(exc)
+            print(
+                f"whisper-dictation: continuous recorder consumer failed: {exc}",
+                file=sys.stderr,
+            )
+            try:
+                for pcm in segmenter.finish():
+                    self._stage_stream_pcm(pcm, session_id)
+            except IncompletePcmSample:
+                aligned = segmenter.recover_aligned_tail()
+                if aligned:
+                    self._stage_stream_pcm(aligned, session_id)
+            self._stage_stream_gap_marker(session_id, error)
+        finally:
+            self._stream_input_bytes = segmenter.total_input_bytes
+            self._stream_output_bytes = segmenter.total_output_bytes
+            self._stream_input_sha256 = segmenter.input_sha256
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+            detail = self._recorder_exit_detail(proc)
+            if error:
+                detail = f"{detail}: {error}"
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+            unexpected = not self._stream_stop_requested.is_set()
+            with self._lock:
+                if self._record_proc is proc and self._record_generation == generation:
+                    self._record_proc = None
+                    self._wav_path = None
+                    self._recording = False
+                    self._tray.set_recording(False)
+            session = self._session_paths.get(session_id)
+            try:
+                self._store.stop_session(session)
+            except Exception as exc:
+                print(
+                    f"whisper-dictation: could not close continuous session: {exc}",
+                    file=sys.stderr,
+                )
+            finally:
+                self._stream_done.set()
+            if unexpected:
+                print(
+                    "whisper-dictation: continuous recorder ended; retained all "
+                    f"drained audio ({detail})",
+                    file=sys.stderr,
+                )
+                self._notify(f"Recorder stopped — saved captured audio ({detail[:80]})")
+
+    def _finish_stream_recording(self, *, deadline: float | None = None) -> None:
+        with self._lock:
+            proc = self._record_proc
+            if proc is None:
+                return
+            self._recording = False
+            self._tray.set_recording(False)
+            self._stream_stop_requested.set()
+        graceful_stop_recorder(
+            proc,
+            None,
+            self.recorder_stop_flush_msec,
+            deadline=deadline,
+        )
+        wait_seconds = remaining_timeout(deadline, 5.0)
+        if not self._stream_done.wait(wait_seconds):
+            print(
+                "whisper-dictation: continuous recorder drain exceeded deadline; "
+                "buffer remains owned by reader",
+                file=sys.stderr,
+            )
+
     def _stage_chunk(
         self,
         wav: str | None,
@@ -717,7 +1232,7 @@ class Dictation:
         session_id: int,
         *,
         finalize: bool = False,
-    ) -> None:
+    ) -> bool:
         """Finalize-order gate: chunks enter the worker FIFO in seq order."""
         session = self._session_paths.get(session_id)
         if session is None:
@@ -726,11 +1241,11 @@ class Dictation:
                 file=sys.stderr,
             )
             self._submit_in_order(seq, None)
-            return
+            return False
         if not wav:
             marker = SessionPasteJob(session, session_id) if finalize else None
             self._submit_in_order(seq, marker)
-            return
+            return True
         try:
             job = self._store.ingest(
                 session,
@@ -747,6 +1262,28 @@ class Dictation:
                 file=sys.stderr,
             )
             try:
+                committed = self._store.reconcile_committed_job(
+                    session,
+                    seq,
+                    paste=True,
+                    paste_session=session_id,
+                    finalize=finalize,
+                )
+            except Exception as reconcile_exc:
+                committed = None
+                print(
+                    "whisper-dictation: could not reconcile committed chunk "
+                    f"{seq}: {reconcile_exc}",
+                    file=sys.stderr,
+                )
+            if isinstance(committed, ChunkJob):
+                print(
+                    f"whisper-dictation: requeued committed chunk {seq}",
+                    file=sys.stderr,
+                )
+                self._submit_in_order(seq, committed)
+                return True
+            try:
                 self._store.record_gap(session, seq, duration, str(exc))
             except Exception as marker_exc:
                 print(
@@ -755,9 +1292,10 @@ class Dictation:
                 )
             marker = SessionPasteJob(session, session_id) if finalize else None
             self._submit_in_order(seq, marker)
-            return
+            return False
 
         self._submit_in_order(seq, job)
+        return True
 
     def _submit_in_order(
         self, seq: int, job: ChunkJob | SessionPasteJob | None
@@ -956,6 +1494,9 @@ class Dictation:
         self._notify(f"Recorder unavailable — saved prior audio ({reason[:80]})")
 
     def _start_recording(self) -> None:
+        if self.continuous_capture:
+            self._start_stream_recording()
+            return
         started = False
         hold = False
         watch: tuple[subprocess.Popen, str, int] | None = None
@@ -987,7 +1528,13 @@ class Dictation:
             now = time.monotonic()
             self._session_start = now
             self._session_id += 1
-            self._active_session = self._store.start_session()
+            self._active_session = self._store.start_session(
+                capture_mode="legacy",
+                beam_size=self.beam_size,
+                audio_ctx=self.audio_ctx,
+                trailing_silence_seconds=self.trailing_silence_seconds,
+                minimum_audio_rms=self.min_audio_rms,
+            )
             self._session_paths[self._session_id] = self._active_session
             self._tray.set_recording(True)
             generation = self._activate_recorder_locked(spawned)
@@ -1113,6 +1660,9 @@ class Dictation:
             self._finalize_lock.release()
 
     def _finish_recording_locked(self, *, deadline: float | None = None) -> None:
+        if self.continuous_capture:
+            self._finish_stream_recording(deadline=deadline)
+            return
         with self._lock:
             if not self._recording and self._record_proc is None:
                 return
@@ -1156,14 +1706,17 @@ class Dictation:
         session_id = job.paste_session
         listening = job.paste and self._recording and session_id == self._session_id
         self._store.begin(job)
-        if duration < self.min_record:
+        if duration < self.min_record and job.capture_mode != "continuous":
             self._store.terminal(job, "ignored", "recording was too short")
             if not listening:
                 self._notify("Too short — speak longer, then Ctrl+Space to stop")
             return
 
         wav_bytes = os.path.getsize(wav) if os.path.exists(wav) else 0
-        if wav_bytes < MIN_USABLE_WAV_BYTES:
+        minimum_wav_bytes = (
+            46 if job.capture_mode == "continuous" else MIN_USABLE_WAV_BYTES
+        )
+        if wav_bytes < minimum_wav_bytes:
             if not listening:
                 hint = "check mic in Settings → Sound → Input"
                 if self.audio_source:
@@ -1178,23 +1731,43 @@ class Dictation:
         except (EOFError, wave.Error) as exc:
             self._store.fail(job, "corrupt", str(exc))
             return
-        if rms < self.min_audio_rms:
+        minimum_audio_rms = job.minimum_audio_rms
+        if rms < minimum_audio_rms:
             self._store.terminal(job, "silent", f"RMS {rms:.0f}")
-            if not listening:
+            if not listening and job.capture_mode != "continuous":
                 self._notify(
-                    f"No speech detected (mic level {rms:.0f}, need ≥{self.min_audio_rms:.0f}) — "
+                    f"No speech detected (mic level {rms:.0f}, need ≥{minimum_audio_rms:.0f}) — "
                     "check mic / wrong input device (run: bash scripts/dictation/test-mic.sh)"
                 )
             return
 
         text = ""
+        inference_started = time.monotonic()
         try:
-            text = apply_replacements(self._transcribe(wav), self.replacements)
+            with prepared_padded_wav(
+                job.wav_path,
+                job.trailing_silence_seconds,
+            ) as inference_wav:
+                inference_path = str(inference_wav)
+                profile: dict[str, int] = {}
+                if job.beam_size is not None:
+                    profile["beam_size"] = job.beam_size
+                if job.audio_ctx is not None:
+                    profile["audio_ctx"] = job.audio_ctx
+                raw_text = self._transcribe(inference_path, **profile)
+                text = apply_replacements(
+                    raw_text,
+                    self.replacements,
+                )
         except Exception as exc:
             print(f"whisper-dictation: transcription failed: {exc}", file=sys.stderr)
             self._notify(f"Transcription failed: {str(exc)[:80]}")
             self._store.fail(job, detail=str(exc))
             return
+        finally:
+            timings = getattr(self, "_inference_timings", None)
+            if timings is not None:
+                timings.append(time.monotonic() - inference_started)
 
         print(
             f"whisper-dictation: chunk={job.chunk_index} transcript_chars={len(text)} "
@@ -1213,7 +1786,7 @@ class Dictation:
         # Punctuation-only is never real dictation. Phrase hallucinations like
         # "thank you" are only dropped on quiet clips so spoken "bye" still works.
         if is_punctuation_only(text) or (
-            is_likely_hallucination(text) and rms < self.min_audio_rms * 2
+            is_likely_hallucination(text) and rms < minimum_audio_rms * 2
         ):
             self._store.terminal(job, "ignored", f"likely hallucination: {text[:80]}")
             if not listening:
@@ -1310,13 +1883,37 @@ class Dictation:
             time.sleep(0.2)
         return False
 
-    def _transcribe(self, wav_path: str) -> str:
+    def _transcribe(
+        self,
+        wav_path: str,
+        *,
+        beam_size: int | None = None,
+        audio_ctx: int | None = None,
+    ) -> str:
+        def server_request(selected_beam: int | None) -> str | None:
+            profile: dict[str, int] = {}
+            if selected_beam is not None:
+                profile["beam_size"] = selected_beam
+            if audio_ctx is not None:
+                profile["audio_ctx"] = audio_ctx
+            return self._transcribe_server(wav_path, **profile)
+
+        def cli_request(cli: Path | None = None) -> str:
+            profile: dict[str, object] = {}
+            if cli is not None:
+                profile["cli"] = cli
+            if beam_size is not None:
+                profile["beam_size"] = beam_size
+            if audio_ctx is not None:
+                profile["audio_ctx"] = audio_ctx
+            return self._transcribe_cli(wav_path, **profile)
+
         if self.backend == "server":
-            text = self._transcribe_server(wav_path)
+            text = server_request(beam_size)
             if self._valid_server_text(text):
                 return text
 
-            restart_beam_size: int | None = None
+            restart_beam_size: int | None = beam_size
             if text is None:
                 print(
                     "whisper-dictation: server unavailable; recovering "
@@ -1324,28 +1921,24 @@ class Dictation:
                     file=sys.stderr,
                 )
             else:
+                retry_beam_size = beam_size or 5
                 print(
                     f"whisper-dictation: server returned unusable text {text!r}; "
                     "retrying with beam search",
                     file=sys.stderr,
                 )
-                text = self._transcribe_server(wav_path, beam_size=5)
+                text = server_request(retry_beam_size)
                 if self._valid_server_text(text):
                     return text
-                restart_beam_size = 5
+                restart_beam_size = retry_beam_size
 
             self._notify("Dictation server stuck — restarting…")
             if self._restart_whisper_server():
-                if restart_beam_size is None:
-                    text = self._transcribe_server(wav_path)
-                else:
-                    text = self._transcribe_server(
-                        wav_path, beam_size=restart_beam_size
-                    )
+                text = server_request(restart_beam_size)
                 if self._valid_server_text(text):
                     return text
                 if restart_beam_size is None and text is not None:
-                    text = self._transcribe_server(wav_path, beam_size=5)
+                    text = server_request(5)
                     if self._valid_server_text(text):
                         return text
             cpu = self._cpu_fallback_cli()
@@ -1354,16 +1947,23 @@ class Dictation:
                     f"whisper-dictation: falling back to CPU whisper-cli ({cpu})",
                     file=sys.stderr,
                 )
-                return self._transcribe_cli(wav_path, cli=cpu)
+                return cli_request(cpu)
             self._notify("Dictation server stuck — try again in a moment")
             return ""
-        return self._transcribe_cli(wav_path)
+        return cli_request()
 
     @staticmethod
     def _valid_server_text(text: str | None) -> bool:
         return bool(text and not is_punctuation_only(text))
 
-    def _transcribe_cli(self, wav_path: str, cli: Path | None = None) -> str:
+    def _transcribe_cli(
+        self,
+        wav_path: str,
+        cli: Path | None = None,
+        *,
+        beam_size: int | None = None,
+        audio_ctx: int | None = None,
+    ) -> str:
         binary = cli or self.cli
         cmd = [
             str(binary),
@@ -1380,6 +1980,10 @@ class Dictation:
         ]
         if self.suppress_nst:
             cmd.append("-sns")
+        if beam_size is not None:
+            cmd.extend(["-bs", str(beam_size)])
+        if audio_ctx is not None:
+            cmd.extend(["-ac", str(audio_ctx)])
         if self.prompt:
             cmd.extend(["--prompt", self.prompt])
         try:
@@ -1400,7 +2004,11 @@ class Dictation:
         return parse_transcript_output(result.stdout)
 
     def _transcribe_server(
-        self, wav_path: str, *, beam_size: int | None = None
+        self,
+        wav_path: str,
+        *,
+        beam_size: int | None = None,
+        audio_ctx: int | None = None,
     ) -> str | None:
         """POST WAV to whisper-server. Return None to signal connection/HTTP failure."""
         if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
@@ -1429,6 +2037,8 @@ class Dictation:
         ]
         if beam_size is not None:
             cmd.extend(["-F", f"beam_size={beam_size}"])
+        if audio_ctx is not None:
+            cmd.extend(["-F", f"audio_ctx={audio_ctx}"])
         if self.prompt:
             cmd.extend(["-F", f"prompt={self.prompt}"])
         if self.carry_initial_prompt:
