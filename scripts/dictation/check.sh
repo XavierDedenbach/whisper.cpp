@@ -22,6 +22,7 @@ SERVER_URL="http://127.0.0.1:8178"
 ACCELERATOR="${WHISPER_ACCELERATOR:-}"
 SYCL_DEVICE="${WHISPER_SYCL_DEVICE:-0}"
 SYCL_EXPECTED_DEVICE="${WHISPER_SYCL_EXPECTED_DEVICE:-}"
+CONTINUOUS_CAPTURE="0"
 if [[ -f "${CFG}" ]]; then
     # shellcheck disable=SC1090
     set -a
@@ -31,6 +32,7 @@ if [[ -f "${CFG}" ]]; then
     MODEL_NAME="${WHISPER_MODEL:-$MODEL_NAME}"
     BACKEND="${WHISPER_BACKEND:-$BACKEND}"
     SERVER_URL="${WHISPER_SERVER_URL:-$SERVER_URL}"
+    CONTINUOUS_CAPTURE="${CONTINUOUS_CAPTURE:-0}"
 fi
 MODEL="${ROOT}/models/ggml-${MODEL_NAME}.bin"
 
@@ -63,9 +65,18 @@ if [[ "${ACCELERATOR,,}" == "sycl" ]]; then
 fi
 
 REC=0
-for cmd in pw-record parecord arecord; do
-    command -v "${cmd}" >/dev/null && ok "recorder: ${cmd}" && REC=1 && break
-done
+if [[ "${CONTINUOUS_CAPTURE,,}" =~ ^(1|true|yes|on)$ ]]; then
+    if command -v parecord >/dev/null; then
+        ok "recorder: parecord (continuous raw PCM)"
+        REC=1
+    else
+        bad "CONTINUOUS_CAPTURE requires parecord (install pulseaudio-utils)"
+    fi
+else
+    for cmd in pw-record parecord arecord; do
+        command -v "${cmd}" >/dev/null && ok "recorder: ${cmd}" && REC=1 && break
+    done
+fi
 [[ "${REC}" -eq 1 ]] || bad "no audio recorder (install pulseaudio-utils)"
 
 command -v xdotool >/dev/null && ok xdotool || bad "xdotool missing"
@@ -133,7 +144,7 @@ if [[ -x "${CLI}" && -f "${MODEL}" ]]; then
     trap 'rm -f "${CLI_LOG:-}"' EXIT
     # Keep diagnostic prints enabled so the selected backend/device can be proved.
     # They go to stderr; stdout remains the transcript consumed below.
-    OUT=$("${CLI}" -m "${MODEL}" -f "${ROOT}/samples/jfk.wav" -nt -t 4 -l en -sns 2>"${CLI_LOG}" | tail -1)
+    OUT=$("${CLI}" -m "${MODEL}" -f "${ROOT}/samples/jfk.wav" -nt -t 4 -l en -sns -bs 1 -bo 1 2>"${CLI_LOG}" | tail -1)
     [[ -n "${OUT}" ]] && ok "cli transcription: ${OUT:0:60}..." || bad "transcription returned empty"
     if [[ "${ACCELERATOR,,}" == "sycl" ]]; then
         SYCL_EXPECTED_MATCH=1

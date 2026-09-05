@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ADR-001 — Long-form dictation audio ownership</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=Space+Grotesk:wght@400;500;600&amp;display=swap" rel="stylesheet" />
+  <style>
+:root { --bg:#0b0f0c; --surface:#141a16; --ink:#e6edf3; --muted:#8b9a90; --accent:#10b981; --destructive:#f87171; --line:#2a332e; --soft:rgba(16,185,129,0.14); --danger-soft:rgba(248,113,113,0.14); --payload:#b91c1c; }
+@media (prefers-color-scheme: light) { :root { --bg:#f3f6f3; --surface:#ffffff; --ink:#1a2420; --muted:#5c6b62; --accent:#059669; --destructive:#dc2626; --line:#d5ddd6; --soft:rgba(5,150,105,0.12); --danger-soft:rgba(220,38,38,0.10); --payload:#b91c1c; } }
+* { box-sizing: border-box; }
+html, body { background: var(--bg); color: var(--ink); }
+body { margin: 0; font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 0.82rem; font-weight: 400; line-height: 1.55; }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 1.5rem 3rem; }
+h1 { font-family: "Space Grotesk", sans-serif; font-size: 1.85rem; font-weight: 600; line-height: 1.15; margin: 0 0 0.55rem; }
+h3 { font-family: "Space Grotesk", sans-serif; font-size: 1.15rem; font-weight: 500; margin: 1.6rem 0 0.55rem; }
+h4 { font-family: "IBM Plex Mono", monospace; font-size: 0.75rem; font-weight: 500; color: var(--muted); margin: 1.1rem 0 0.4rem; }
+p, li { max-width: 82ch; }
+a { color: var(--accent); }
+code { font-family: "IBM Plex Mono", monospace; }
+.eyebrow { font-size: 0.7rem; font-weight: 500; color: var(--muted); margin: 0 0 0.45rem; }
+.lede { font-family: "Space Grotesk", sans-serif; font-size: 0.95rem; font-weight: 400; max-width: 74ch; margin: 0 0 1rem; }
+.masthead { padding: 2rem 0 1.15rem; border-bottom: 1px solid var(--line); }
+.meta { display: grid; grid-template-columns: 8.5rem 1fr; gap: 0.2rem 0.8rem; margin: 0; font-size: 0.75rem; }
+.meta dt { color: var(--muted); font-weight: 500; }
+.meta dd { margin: 0; }
+.chip { display: inline-block; border: 1px solid var(--accent); color: var(--accent); padding: 0.05rem 0.4rem; font-size: 0.7rem; font-weight: 500; }
+.band-marker { font-size: 0.7rem; font-weight: 500; color: var(--muted); border-top: 1px solid var(--line); margin: 2.4rem 0 1.1rem; padding-top: 0.4rem; }
+.lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin: 0.4rem 0 0.2rem; }
+@media (max-width: 800px) { .lanes { grid-template-columns: 1fr; } }
+.lane { background: var(--surface); border: 1px solid var(--line); padding: 0.7rem 0.9rem 0.9rem; }
+.lane h3 { margin-top: 0; }
+figure { margin: 1.1rem 0 0.4rem; }
+.dg { width: 100%; height: auto; display: block; background: var(--surface); border: 1px solid var(--line); }
+figcaption { font-size: 0.75rem; color: var(--muted); margin: 0.45rem 0 0.6rem; }
+figcaption b { color: var(--ink); font-weight: 500; }
+table { width: 100%; border-collapse: collapse; margin: 0.6rem 0 1rem; font-size: 0.82rem; }
+th, td { border: 1px solid var(--line); padding: 0.4rem 0.55rem; text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+ol.decisions { padding-left: 1.2rem; }
+ol.decisions li { margin: 0.45rem 0; max-width: 82ch; }
+footer { margin-top: 2.2rem; padding-top: 0.8rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.75rem; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+<header class="masthead">
+  <p class="eyebrow">architecture decision record</p>
+  <h1>Long-form dictation audio ownership</h1>
+  <p class="lede">One recorder owns the microphone continuously from start through stop. The dictation application divides the received PCM stream into durable chunks without restarting that recorder, then transcribes and delivers those chunks in order. A bounded per-session encoder context may reduce inference work when it safely covers the complete padded chunk.</p>
+  <dl class="meta">
+    <dt>ID</dt><dd>ADR-001</dd>
+    <dt>Date</dt><dd>2026-09-05</dd>
+    <dt>Status</dt><dd><span class="chip">Accepted</span></dd>
+    <dt>Authors</dt><dd>Xavier Dedenbach</dd>
+    <dt>Approved by</dt><dd>Xavier Dedenbach — 2026-09-04</dd>
+    <dt>Scope size</dt><dd>M</dd>
+    <dt>Input</dt><dd><a href="../bugs/dictation/2026-09-05-recorder-reacquisition-gaps.md">recorder reacquisition defect</a> and <a href="../prototypes/dictation-numeric-continuity.md">numeric continuity evidence</a></dd>
+    <dt>Plans</dt><dd><a href="../plans/dictation-temporal-segmentation.md">active temporal-segmentation plan</a>; <a href="../plans/dictation-overlap-continuity.md">superseded overlap plan</a></dd>
+  </dl>
+</header>
+
+<p class="band-marker">pulse check</p>
+
+<h3>Decision summary</h3>
+<p>Long-form dictation uses one persistent <code>parecord --raw</code> child as the sole microphone owner. A reader inside the application owns every signed-16, 16 kHz, mono PCM byte until recorder EOF. It partitions those bytes exactly once into independent durable WAV files, records every chunk or visible gap under one ordered sequence, and lets transcription run behind capture without opening the microphone again. Stop drains the recorder, retains the final partial chunk, closes the session, and dispatches one paste after all live jobs reach an ordered terminal state. Inference may use a persisted encoder context that is validated to contain the maximum padded chunk. This mode is opt-in; legacy recorders and CPU, CUDA, and SYCL inference selection remain available unchanged.</p>
+
+<div class="lanes">
+  <section class="lane">
+    <h3>Before</h3>
+    <p>The long-session path tied each transcription slice to a separate recorder process. At a time boundary it stopped one process, finalized its WAV, and started another process against the same microphone. A delayed or failed reacquisition could create an empty file and a period for which no process owned incoming audio. Recovery could retain and retry existing files, but it could not reconstruct speech that never entered the application.</p>
+  </section>
+  <section class="lane">
+    <h3>Why</h3>
+    <p>Real three-minute dictation repeatedly delivered the beginning and final partial while omitting one or more middle chunks. The same microphone worked before and after each omission, so per-file retries did not close the ownership gap. A sealed 521-second production-path run later proved that one recorder plus application-owned partitioning can retain all 16,689,920 captured bytes across 65 chunks and one final paste.</p>
+  </section>
+</div>
+
+<h3>Decision flow</h3>
+<p>This figure makes the ownership boundary clear: microphone capture never restarts at a transcription boundary, and either a durable job or a visible gap advances each sequence.</p>
+<figure>
+  <svg class="dg" viewBox="0 0 1120 390" role="img" aria-label="One recorder continuously feeds an application segmenter; every sequence becomes either a durable WAV job or a visible gap before ordered delivery.">
+    <style>
+      .t { font-family: "Space Grotesk", sans-serif; font-size: 12px; font-weight: 500; fill: var(--ink); }
+      .s { font-family: "IBM Plex Mono", monospace; font-size: 10px; font-weight: 400; fill: var(--muted); }
+      .e { font-family: "IBM Plex Mono", monospace; font-size: 10px; font-weight: 400; fill: var(--ink); }
+      .box { fill: var(--surface); stroke: var(--muted); stroke-width: 1.5; }
+      .chosen { fill: var(--soft); stroke: var(--accent); stroke-width: 2; }
+      .fail { fill: var(--danger-soft); stroke: var(--destructive); stroke-width: 2; }
+      .dia { fill: var(--surface); stroke: var(--muted); stroke-width: 1.5; }
+      .ink { stroke: var(--ink); stroke-width: 2.5; fill: none; marker-end: url(#ink-arrow); }
+      .data { stroke: var(--payload); stroke-width: 3; fill: none; marker-end: url(#data-arrow); }
+    </style>
+    <defs>
+      <marker id="ink-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--ink)" /></marker>
+      <marker id="data-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--payload)" /></marker>
+    </defs>
+
+    <rect class="box" x="20" y="72" width="130" height="72" rx="2" />
+    <text class="t" x="85" y="100" text-anchor="middle">Hotkey session</text>
+    <text class="s" x="85" y="119" text-anchor="middle">start, then stop</text>
+
+    <rect class="chosen" x="190" y="72" width="158" height="72" rx="2" />
+    <text class="t" x="269" y="99" text-anchor="middle">One recorder</text>
+    <text class="s" x="269" y="117" text-anchor="middle">sole mic owner</text>
+    <text class="s" x="269" y="131" text-anchor="middle">through EOF</text>
+
+    <rect class="chosen" x="394" y="72" width="164" height="72" rx="2" />
+    <text class="t" x="476" y="99" text-anchor="middle">PCM segmenter</text>
+    <text class="s" x="476" y="117" text-anchor="middle">each sample once</text>
+    <text class="s" x="476" y="131" text-anchor="middle">quiet 7–9 s cuts</text>
+
+    <polygon class="dia" points="594,108 664,62 734,108 664,154" />
+    <text class="t" x="664" y="105" text-anchor="middle">Chunk durable?</text>
+    <text class="s" x="664" y="121" text-anchor="middle">same sequence</text>
+
+    <rect class="chosen" x="782" y="72" width="152" height="72" rx="2" />
+    <text class="t" x="858" y="99" text-anchor="middle">Ordered jobs</text>
+    <text class="s" x="858" y="117" text-anchor="middle">WAV or gap marker</text>
+    <text class="s" x="858" y="131" text-anchor="middle">inference may lag</text>
+
+    <rect class="box" x="972" y="72" width="128" height="72" rx="2" />
+    <text class="t" x="1036" y="99" text-anchor="middle">Transcript</text>
+    <text class="s" x="1036" y="117" text-anchor="middle">retained WAVs</text>
+    <text class="s" x="1036" y="131" text-anchor="middle">one final paste</text>
+
+    <rect class="fail" x="562" y="266" width="204" height="76" rx="2" />
+    <text class="t" x="664" y="294" text-anchor="middle">Visible gap</text>
+    <text class="s" x="664" y="313" text-anchor="middle">retain source if possible</text>
+    <text class="s" x="664" y="327" text-anchor="middle">advance exact sequence</text>
+
+    <line class="ink" x1="150" y1="108" x2="186" y2="108" />
+    <text class="e" x="168" y="94" text-anchor="middle">Start</text>
+    <line class="data" x1="348" y1="108" x2="390" y2="108" />
+    <text class="e" x="369" y="94" text-anchor="middle">PCM</text>
+    <line class="data" x1="558" y1="108" x2="590" y2="108" />
+    <line class="ink" x1="734" y1="108" x2="778" y2="108" />
+    <text class="e" x="756" y="94" text-anchor="middle">Ready</text>
+    <line class="ink" x1="934" y1="108" x2="968" y2="108" />
+    <line class="ink" x1="664" y1="154" x2="664" y2="262" />
+    <text class="e" x="678" y="214" text-anchor="start">Missing</text>
+    <path class="ink" d="M766 304 H858 V148" />
+  </svg>
+  <figcaption><b>Message.</b> One process owns the live bytes; storage and inference boundaries can fail without reopening the microphone or blocking later sequence delivery.</figcaption>
+</figure>
+
+<h4>Key</h4>
+<table>
+  <tr><th>Internal</th><th>Chosen path</th><th>Fail</th><th>Internal msg / state</th><th>Large data</th></tr>
+  <tr><td>Surface box, ink text</td><td>Emerald box</td><td>Destructive box</td><td>Solid ink</td><td>Solid dark red</td></tr>
+</table>
+
+<table>
+  <tr><th>Condition</th><th>Path taken</th><th>Result</th></tr>
+  <tr><td>WAV and manifest state are durable</td><td>Ready</td><td>Enqueue the chunk for ordered inference without slowing capture</td></tr>
+  <tr><td>Wrapping or persistence cannot make the current chunk durable</td><td>Missing</td><td>Record a visible marker at that sequence, retain any recoverable source, and continue with later audio</td></tr>
+</table>
+
+<h3>Decisions</h3>
+<ol class="decisions">
+  <li><strong>One recorder process owns all live microphone bytes for a long-form session.</strong> Storage and inference boundaries are application events and never require microphone reacquisition.</li>
+  <li><strong>Every received PCM sample belongs to exactly one durable segment.</strong> The reader owns startup bytes, odd reads, EOF drain, and the final partial; no overlap or transcript matching may delete repeated speech.</li>
+  <li><strong>Every sequence advances as a durable job or a visible failure marker.</strong> Inference, storage, and recovery faults cannot silently block or omit later chunks.</li>
+  <li><strong>Recognition accuracy remains separate from capture integrity.</strong> Retained WAVs are the recovery source when the selected model substitutes or omits words. An optional encoder context is persisted and must cover the complete padded chunk.</li>
+  <li><strong>The path is opt-in and inference portability is unchanged.</strong> Legacy <code>pw-record</code>, <code>parecord</code>, and <code>arecord</code> behavior remains the default; CPU, CUDA, and SYCL selection stays independent.</li>
+</ol>
+
+<p class="band-marker">reviewer</p>
+
+<h3>Evidence</h3>
+<table>
+  <tr><th>Evidence</th><th>Observed result</th><th>What it proves</th></tr>
+  <tr><td>Repeated human multi-minute dictation</td><td>Middle chunks missing while first and final chunks arrived</td><td>Rolling source ownership was not reliable enough; it does not identify a decoder defect</td></tr>
+  <tr><td>Implemented 1–150 production-path fixture</td><td>One recorder PID; 4,949,760 bytes reconstructed exactly; no failed chunks; one paste; exact recognition</td><td>The selected ownership and segmentation path works through real PulseAudio and the warm SYCL server</td></tr>
+  <tr><td>Sole sealed 1–500 fixture</td><td>One recorder PID; all 16,689,920 bytes across 65 WAVs; no failed chunks; one paste; 483/500 values recognized exactly</td><td>Capture, storage, ordering, and delivery remain lossless for 521 seconds; the remaining error is model recognition under R-4</td></tr>
+  <tr><td>Post-holdout 1–150 performance fixture</td><td>Context 512 with the same <code>small.en</code> model, beam five, and 8/7/9 segmentation returned 150/150 exactly; queue depth one; 1.454–6.185 seconds per request under load near 11</td><td>A safely bounded encoder context removes unnecessary 30-second encoder work without changing capture or the sealed holdout</td></tr>
+  <tr><td>122 automated tests</td><td>Recorder EOF, odd reads, rejected-child reaping, second/third-chunk faults, post-commit recovery, cross-filesystem retention, stderr pressure, legacy recovery, inference-profile persistence, and portability pass</td><td>Known failure paths have direct regression coverage without rerunning the sealed holdout</td></tr>
+</table>
+
+<h3>Effect on existing ADRs</h3>
+<table>
+  <tr><th>Existing ADR</th><th>Change if this ADR is accepted</th></tr>
+  <tr><td>None in this fork</td><td>This becomes the first durable decision for the local dictation wrapper; it does not alter upstream whisper.cpp decoder contracts.</td></tr>
+</table>
+
+<h3>Risks and trade-offs</h3>
+<table>
+  <tr><th>Risk or accepted cost</th><th>Why it matters</th><th>Decision or plan handoff</th></tr>
+  <tr><td>Continuous mode requires <code>parecord --raw</code></td><td>Other recorder tools do not expose the same tested stream contract</td><td>Mode stays disabled by default and fails clearly when <code>parecord</code> is unavailable</td></tr>
+  <tr><td>Inference may lag capture</td><td>A long session can build a queue on a slower backend</td><td>Capture owns no inference wait; all WAVs stay durable and recovery is exhaustive</td></tr>
+  <tr><td>A storage fault can still make one segment unavailable</td><td>No software can promise durability after the storage layer refuses writes</td><td>The exact sequence receives a visible marker, recoverable sources are retained, and later chunks continue</td></tr>
+  <tr><td><code>small.en</code> can misrecognize complete audio</td><td>Lossless bytes do not imply perfect text</td><td>R-4 accepts the measured model limit; retained WAVs permit later reprocessing</td></tr>
+  <tr><td>A reduced encoder context is experimental</td><td>A context shorter than the padded input could truncate evidence or reduce recognition quality</td><td>The setting is opt-in, persisted per session, validated against the maximum padded continuous chunk, and covered by a separate exact development run</td></tr>
+</table>
+
+<h3>Interfaces and ownership</h3>
+<table>
+  <tr><th>Interface or area</th><th>Owner</th><th>What changes</th></tr>
+  <tr><td>Microphone process lifetime</td><td>Dictation daemon</td><td>One raw recorder from successful start through drained EOF</td></tr>
+  <tr><td>PCM segmentation</td><td>Dictation daemon</td><td>Exact application-owned sample partition with bounded low-energy cuts</td></tr>
+  <tr><td>WAVs, manifest, and transcript</td><td>Session store</td><td>Durable sequence state, retained audio, exhaustive restart recovery</td></tr>
+  <tr><td>Recognition</td><td>Configured whisper.cpp backend</td><td>Independent chunks; optional temporary silence padding, beam size, and bounded audio context; retained WAV unchanged</td></tr>
+  <tr><td>Text delivery</td><td>Dictation daemon</td><td>One ordered paste after live terminal states; recovery never fabricates missing text</td></tr>
+  <tr><td>Backend selection</td><td>Existing runtime wrapper</td><td>Unchanged CPU, CUDA, and SYCL selection and fallback policy</td></tr>
+</table>
+
+<h3>Options not chosen</h3>
+<table>
+  <tr><th>Option</th><th>Why it could work</th><th>Why rejected</th></tr>
+  <tr><td>Restart a recorder for every slice</td><td>Simple WAV lifecycle and already implemented</td><td>Creates an interval with no guaranteed microphone owner at every boundary; observed empty and missing middle chunks cannot be recovered afterward</td></tr>
+  <tr><td>Overlap audio and merge adjacent transcripts</td><td>Redundant boundary audio can improve recognition and passed one synthetic 1–150 prototype</td><td>Token matching can delete legitimate repeated phrases, timestamp decoding exceeded the producer budget, and the extra mechanism is unnecessary for byte-exact capture</td></tr>
+  <tr><td>Record one large WAV and transcribe only after stop</td><td>One process avoids reacquisition and needs no segmenter</td><td>Defers all feedback and recovery work, makes a long inference the only completion path, and loses bounded per-chunk retry isolation</td></tr>
+</table>
+
+<p class="band-marker">developer</p>
+
+<h3>Raw PCM stream layout</h3>
+<p>Frame: repeating two-byte samples, little-endian, 16,000 samples per second, one channel, PulseAudio raw stream.</p>
+<table>
+  <tr><th>Offset / byte</th><th>Size</th><th>Field</th><th>Value or range</th><th>Written by</th><th>On mismatch</th></tr>
+  <tr><td><code>2n</code>–<code>2n+1</code></td><td>2</td><td>PCM sample</td><td>signed 16-bit little-endian amplitude</td><td><code>parecord</code></td><td>Retain an unaligned final byte separately, mark the session gap, and never invent a sample</td></tr>
+</table>
+
+<h3>Capture ownership contract</h3>
+<table>
+  <tr><th>Rule</th><th>Required behavior</th></tr>
+  <tr><td>Recorder count</td><td>Exactly one successful recorder PID per continuous session; no automatic reconnect across an unknowable gap</td></tr>
+  <tr><td>Reader ownership</td><td>The same reader consumes readiness bytes and every later stdout byte through EOF</td></tr>
+  <tr><td>Sample ownership</td><td>Concatenated durable chunk PCM equals every complete sample read from recorder stdout, in order, exactly once</td></tr>
+  <tr><td>Boundary selection</td><td>Choose a low-energy cut from configured minimum through maximum duration; the final partial may be shorter</td></tr>
+  <tr><td>Failure sequence</td><td>Each reserved index becomes a queued WAV job or a visible terminal marker before later indexes are submitted</td></tr>
+  <tr><td>Recorder diagnostics</td><td>Stderr is drained continuously into a bounded tail and cannot block stdout capture</td></tr>
+</table>
+
+<h3>Durability and delivery contract</h3>
+<table>
+  <tr><th>Operation</th><th>Required bound</th></tr>
+  <tr><td>Capture versus inference</td><td>Recorder stdout consumption never waits for one chunk's inference</td></tr>
+  <tr><td>Temporary inference files</td><td>Deleted after each request; durable source WAV hashes remain unchanged</td></tr>
+  <tr><td>Restart recovery</td><td>Discover every non-terminal retained chunk; no fixed recovery-count ceiling</td></tr>
+  <tr><td>Live ordering</td><td>No later chunk or final marker waits forever on an unsubmitted sequence</td></tr>
+  <tr><td>Delivery</td><td>At most one live paste per stopped session, assembled from ordered completed fragments</td></tr>
+</table>
+
+<h3>Compatibility contract</h3>
+<table>
+  <tr><th>Configuration</th><th>Required behavior</th></tr>
+  <tr><td><code>CONTINUOUS_CAPTURE=0</code> or absent</td><td>Use the legacy recorder and <code>MAX_RECORD_SEC</code> behavior, including legacy transcript markers</td></tr>
+  <tr><td><code>CONTINUOUS_CAPTURE=1</code></td><td>Require <code>parecord</code>; persist capture, beam, audio-context, padding, and RMS policy in manifest v2</td></tr>
+  <tr><td><code>WHISPER_AUDIO_CTX</code> set</td><td>Require continuous capture; pass the same context to server, CLI, retries, and recovery; reject profiles that cannot contain their maximum padded chunk</td></tr>
+  <tr><td>Manifest v1</td><td>Recover with legacy behavior and the current machine's configured RMS threshold</td></tr>
+  <tr><td>CPU, CUDA, or SYCL</td><td>Use the existing runtime choice; capture segmentation adds no backend preference</td></tr>
+</table>
+
+<h3>Required acceptance evidence</h3>
+<ul>
+  <li>A real production-path 1–150 recording uses one recorder PID, reconstructs every captured PCM byte from durable chunks, has no failed chunks, pastes once, and recognizes the exact sequence before any sealed holdout begins.</li>
+  <li>The first and only 1–500 holdout records capture and recognition independently. Capture fails if any PCM byte, durable chunk, ordering state, or final paste is missing; a recognition deviation is retained exactly and requires explicit human disposition.</li>
+  <li>Failure injection at an arbitrary second or later chunk proves WAV creation failure, partial manifest commit, cross-filesystem retention, and repeated ingest failure cannot deadlock ordering or suppress later recoverable chunks.</li>
+  <li>A recorder that writes more than the stderr pipe capacity and then writes more PCM must have all stdout PCM drained and its bounded diagnostic tail available.</li>
+  <li>Legacy mode and manifest-v1 tests preserve existing markers and configured RMS behavior; runtime-selection tests remain green for CPU, CUDA, and SYCL paths.</li>
+</ul>
+
+<h3>Related</h3>
+<ul>
+  <li><strong>Implements:</strong> <a href="../plans/dictation-temporal-segmentation.md">lossless temporal segmentation plan</a>.</li>
+  <li><strong>Supersedes:</strong> the production direction proposed by the <a href="../plans/dictation-overlap-continuity.md">corroborated-overlap plan</a>; that plan remains historical evidence.</li>
+  <li><strong>Accepted risks:</strong> <a href="../RISKS.md">R-1 through R-4</a>, especially the separation between model recognition and capture integrity.</li>
+</ul>
+
+<footer>Drafted with agent assistance; accepted by decision owner Xavier Dedenbach on 2026-09-04.</footer>
+</div>
+</body>
+</html>

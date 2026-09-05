@@ -199,6 +199,38 @@ chunk returns only punctuation or no text, the daemon retries once through the
 same selected CPU, CUDA, or SYCL server with beam search. It may restart that
 server once before using the portable CPU `whisper-cli` as the final fallback.
 
+### Robust long recordings
+
+`CONTINUOUS_CAPTURE=1` is the lossless long-form path for systems with
+`parecord`. One recorder process owns the microphone from start to stop. The
+daemon wraps every captured PCM sample exactly once into independent durable
+WAV chunks, choosing quiet cuts near eight seconds, and transcribes those chunks
+while recording continues. It does not overlap, match, or delete transcript
+text. A failed chunk remains visible and recoverable without suppressing later
+chunks; the complete successful text is pasted once after stop.
+
+The mode is disabled by default so existing CPU, CUDA, SYCL, `pw-record`, and
+`arecord` installations keep their current behavior. A tested fast-SYCL profile
+for the LG Gram is:
+
+```bash
+CONTINUOUS_CAPTURE="1"
+STREAM_SEGMENT_TARGET_SEC="8"
+STREAM_SEGMENT_MIN_SEC="7"
+STREAM_SEGMENT_MAX_SEC="9"
+TRANSCRIPTION_TRAILING_SILENCE_SEC="0.5"
+WHISPER_BEAM_SIZE="5"
+WHISPER_AUDIO_CTX="512"
+```
+
+Silence is measured on the retained raw WAV before the temporary padding is
+created. Temporary inference WAVs are always deleted; retained session audio is
+unchanged. If the recorder exits unexpectedly, capture stops rather than
+silently reconnecting across an unknowable gap, and all bytes already drained
+from its pipe remain in the session. Audio context 512 covers 10.24 seconds,
+which safely exceeds this profile's 9.5-second maximum padded input while
+avoiding the default 30-second encoder pass on every short chunk.
+
 ---
 
 ## Install options
@@ -254,7 +286,14 @@ File: `~/.config/whisper-dictation/config.env` (created on first install)
 | `WHISPER_SERVER_TIMEOUT` | `90` | Client `/inference` curl budget in seconds |
 | `WHISPER_INFERENCE_WATCHDOG_SEC` | `90` | Kill and restart the server if an inference socket stays open this long (`0` disables) |
 | `WHISPER_SERVER_RECYCLE_SEC` | `21600` | Recycle a healthy idle server this often (6h) to shed Intel GPU hangs |
-| `MAX_RECORD_SEC` | `45` | Slice length. Auto-rolls and transcribes online, then pastes the assembled session once at stop (`0` = unlimited single take) |
+| `MAX_RECORD_SEC` | `45` | Legacy file-recorder slice length when `CONTINUOUS_CAPTURE=0`; auto-rolls and transcribes online, then pastes the assembled session once at stop (`0` = unlimited single take) |
+| `CONTINUOUS_CAPTURE` | `0` | Use one `parecord --raw` process and application-owned lossless segmentation for long recordings |
+| `STREAM_SEGMENT_TARGET_SEC` | `8` | Preferred continuous-mode low-energy cut interval |
+| `STREAM_SEGMENT_MIN_SEC` | `7` | Earliest continuous-mode cut |
+| `STREAM_SEGMENT_MAX_SEC` | `9` | Latest continuous-mode cut; the final partial may be shorter |
+| `TRANSCRIPTION_TRAILING_SILENCE_SEC` | `0` | Digital silence appended only to a temporary inference WAV; retained audio is unchanged |
+| `WHISPER_BEAM_SIZE` | empty | Optional beam size used on the first server/CLI inference request; empty preserves the existing greedy-first profile |
+| `WHISPER_AUDIO_CTX` | empty | Optional continuous-mode whisper.cpp encoder audio-context token limit (`50` tokens ≈ one second). It requires `CONTINUOUS_CAPTURE=1` and must cover the maximum padded chunk; empty preserves the full 30-second context |
 | `WHISPER_SESSION_DIR` | `~/.local/share/whisper-dictation/sessions` | Durable retained WAV chunks, recovery manifest, and `transcript.txt` for each recording session |
 | `WHISPER_LANGUAGE` | `en` | Language id |
 | `WHISPER_SUPPRESS_NST` | `1` | Suppress non-speech tokens |
@@ -327,6 +366,8 @@ Optional machine-local extras (not in git): `~/.config/whisper-dictation/vocabul
 | `uninstall.sh` | Remove autostart |
 | `dictation.py` | Hotkey daemon |
 | `session_store.py` | Durable WAV chunks, restart recovery, and ordered transcripts |
+| `temporal_audio.py` | Exact streaming PCM partitioning and temporary inference padding |
+| `numeric_continuity_probe.py` | Deterministic long-form playback harness for lossless capture attestation and separately scored recognition continuity |
 | `dictation_indicator.py` | Top-panel tray LED (silver idle, red blink while recording) |
 | `run-server.sh` | Warm `whisper-server` launcher |
 | `build-cuda.sh` | Reproducible NVIDIA CUDA build helper |
