@@ -1,0 +1,4 @@
+pynput
+python-xlib
+pystray
+pillow

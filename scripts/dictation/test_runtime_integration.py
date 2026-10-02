@@ -435,34 +435,12 @@ class RuntimeSelectionTests(unittest.TestCase):
             self.assertIn("--target whisper-cli whisper-server", calls)
 
     def test_check_rejects_cpu_binary_when_sycl_requested(self) -> None:
+        # Exercise the real shell health check against controlled external
+        # binary output. Requiring oneAPI and a downloaded model on the host
+        # prevents this rejection contract from running on CPU/CUDA machines.
         with tempfile.TemporaryDirectory() as tmp:
-            temp = Path(tmp)
-            home = temp / "home"
-            config_dir = home / ".config/whisper-dictation"
-            config_dir.mkdir(parents=True)
-            (config_dir / "install.env").write_text(
-                f'WHISPER_REPO_ROOT="{REPO_ROOT}"\n', encoding="utf-8"
-            )
-            (config_dir / "config.env").write_text(
-                'WHISPER_MODEL="small.en"\n'
-                'WHISPER_BUILD_DIR="build"\n'
-                'WHISPER_ACCELERATOR="sycl"\n'
-                'WHISPER_ONEAPI_SETVARS="/opt/intel/oneapi/setvars.sh"\n'
-                'WHISPER_ONEAPI_DEVICE_SELECTOR="level_zero:gpu"\n'
-                'WHISPER_SYCL_DEVICE="0"\n'
-                'WHISPER_BACKEND="cli"\n',
-                encoding="utf-8",
-            )
-            env = os.environ.copy()
-            env.update({"HOME": str(home), "DISPLAY": os.environ.get("DISPLAY", ":0")})
-            result = subprocess.run(
-                ["bash", str(SCRIPT_DIR / "check.sh")],
-                text=True,
-                capture_output=True,
-                env=env,
-                # A loaded laptop can take over 30 seconds to initialize and run
-                # the real CPU small.en model used by this backend-rejection check.
-                timeout=60,
+            result = self.run_fake_server_check(
+                Path(tmp), accelerator="sycl", cli_reports_accelerator=False
             )
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("selected binary did not report SYCL", result.stdout)
@@ -596,15 +574,19 @@ class RuntimeSelectionTests(unittest.TestCase):
                 repo / "build-sycl/bin/whisper-server",
                 "#!/usr/bin/env bash\n"
                 '[[ "${FAKE_ONEAPI_READY:-0}" == "1" ]] || exit 42\n'
-                'printf "%s\\n" "$$" > "${SERVER_PID_FILE}"\n'
                 'printf "server-start\\n" >> "${EVENT_LOG}"\n'
                 'trap \'printf "server-stop\\n" >> "${EVENT_LOG}"; exit 0\' TERM INT\n'
+                'printf "%s\\n" "$$" > "${SERVER_PID_FILE}"\n'
                 "while true; do sleep 0.1; done\n",
             )
             fake_bin = temp / "bin"
             write_executable(
                 fake_bin / "curl",
                 "#!/usr/bin/env bash\n"
+                # A real endpoint cannot report healthy before its server is
+                # listening. Synchronize the fixture instead of depending on
+                # parent/child scheduling order on a particular machine.
+                '[[ -s "${SERVER_PID_FILE}" ]] || exit 7\n'
                 "output=''\n"
                 "warm=0\n"
                 "previous=''\n"
@@ -709,6 +691,12 @@ class RuntimeSelectionTests(unittest.TestCase):
 
 
 class HangRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests mock subprocess boundaries; never inject desktop input.
+        patcher = mock.patch("dictation.paste_if_focused", return_value="pasted")
+        self.paste = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_notify_replace_id_is_integer(self) -> None:
         from dictation import NOTIFY_REPLACE_ID, build_notify_cmd
 
@@ -733,11 +721,10 @@ class HangRecoveryTests(unittest.TestCase):
         owner.poll.return_value = None
         which = subprocess.CompletedProcess(["which", "xclip"], 0, b"", b"")
         ready = subprocess.CompletedProcess(["xclip"], 0, b"hello", b"")
-        pasted = subprocess.CompletedProcess(["xdotool"], 0, b"", b"")
 
         with mock.patch("dictation.subprocess.Popen", return_value=owner) as popen:
             with mock.patch(
-                "dictation.subprocess.run", side_effect=[which, ready, pasted]
+                "dictation.subprocess.run", side_effect=[which, ready]
             ) as run:
                 app._insert("hello")
 
@@ -757,11 +744,6 @@ class HangRecoveryTests(unittest.TestCase):
                 mock.call(
                     ["xclip", "-selection", "clipboard", "-out"],
                     capture_output=True,
-                    timeout=0.25,
-                ),
-                mock.call(
-                    ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-                    check=False,
                     timeout=0.25,
                 ),
             ],
@@ -796,14 +778,13 @@ class HangRecoveryTests(unittest.TestCase):
         which = subprocess.CompletedProcess(["which", "xclip"], 0, b"", b"")
         first_ready = subprocess.CompletedProcess(["xclip"], 0, b"first", b"")
         second_ready = subprocess.CompletedProcess(["xclip"], 0, b"second", b"")
-        pasted = subprocess.CompletedProcess(["xdotool"], 0, b"", b"")
 
         with mock.patch(
             "dictation.subprocess.Popen", side_effect=[first, second]
         ) as popen:
             with mock.patch(
                 "dictation.subprocess.run",
-                side_effect=[which, first_ready, pasted, which, second_ready, pasted],
+                side_effect=[which, first_ready, which, second_ready],
             ):
                 app._insert("first")
                 app._insert("second")
@@ -827,13 +808,14 @@ class HangRecoveryTests(unittest.TestCase):
                 "dictation.subprocess.run", side_effect=[which, wrong]
             ) as run:
                 with mock.patch(
-                    "dictation.time.monotonic", side_effect=[100.0, 100.0, 100.6]
+                    "dictation.time.monotonic", side_effect=[100.0, 100.0, 103.0]
                 ):
                     with mock.patch("dictation.time.sleep"):
                         self.assertFalse(app._insert("expected"))
 
         owner.terminate.assert_called_once_with()
         self.assertIsNone(app._clipboard_proc)
+        self.paste.assert_not_called()
         self.assertFalse(
             any(call.args[0][0] == "xdotool" for call in run.call_args_list)
         )
@@ -867,25 +849,18 @@ class HangRecoveryTests(unittest.TestCase):
         )
         self.assertIsNone(app._clipboard_proc)
 
-    def test_xdotool_timeout_is_a_bounded_delivery_failure(self) -> None:
+    def test_x11_error_is_not_retried(self) -> None:
         app = self._make_app()
-        command = ["xdotool", "key", "--clearmodifiers", "ctrl+v"]
+        self.paste.return_value = "x11-error:ConnectionClosedError"
+        self.assertFalse(app._paste_if_open(((0, 42), 0)))
+        self.paste.assert_called_once()
+        self.assertEqual(app._last_delivery_reason, self.paste.return_value)
 
-        with mock.patch(
-            "dictation.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(command, timeout=0.25),
-        ) as run:
-            self.assertFalse(app._run_xdotool_if_open(command))
-
-        run.assert_called_once_with(command, check=False, timeout=0.25)
-
-    def test_xdotool_nonzero_exit_is_a_delivery_failure(self) -> None:
+    def test_changed_focus_defers_delivery(self) -> None:
         app = self._make_app()
-        command = ["xdotool", "key", "--clearmodifiers", "ctrl+v"]
-        failed = subprocess.CompletedProcess(command, 1)
-
-        with mock.patch("dictation.subprocess.run", return_value=failed):
-            self.assertFalse(app._run_xdotool_if_open(command))
+        self.paste.return_value = "focus-changed"
+        self.assertFalse(app._paste_if_open(((0, 42), 0)))
+        self.paste.assert_called_once()
 
     def test_clipboard_cleanup_refuses_late_owner_and_typing_fallback(self) -> None:
         app = self._make_app()
@@ -948,11 +923,8 @@ class HangRecoveryTests(unittest.TestCase):
             return True
 
         which = subprocess.CompletedProcess(["which", "xclip"], 0, b"", b"")
-        pasted = subprocess.CompletedProcess(["xdotool"], 0, b"", b"")
         with mock.patch.object(app, "_start_clipboard_owner", side_effect=start_owner):
-            with mock.patch(
-                "dictation.subprocess.run", side_effect=[which, pasted]
-            ) as run:
+            with mock.patch("dictation.subprocess.run", side_effect=[which]) as run:
                 worker = threading.Thread(target=app._insert, args=("ready",))
                 worker.start()
                 self.assertTrue(owner_ready.wait(1))
@@ -2250,7 +2222,9 @@ class HangRecoveryTests(unittest.TestCase):
                                 self.assertEqual(insert.call_count, 0)
                             app._deliver_completed_session(session, session_id=1)
 
-            insert.assert_called_once_with("first second third last partial")
+            insert.assert_called_once_with(
+                "first second third last partial", target=None
+            )
             self.assertEqual(
                 (session / "transcript.txt").read_text(encoding="utf-8"),
                 "first\nsecond\nthird\nlast partial\n",
@@ -2290,7 +2264,7 @@ class HangRecoveryTests(unittest.TestCase):
                     app._chunk_queue.put(None)
                     worker.join(2)
 
-            app._insert.assert_called_once_with("first")
+            app._insert.assert_called_once_with("first", target=None)
 
     def test_final_ingest_failure_queues_delivery_of_prior_chunks(self) -> None:
         from dictation import SessionPasteJob

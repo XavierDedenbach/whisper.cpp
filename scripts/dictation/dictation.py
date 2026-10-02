@@ -36,7 +36,7 @@ if _venv.is_dir():
         break
 
 try:
-    from pynput import keyboard
+    from pynput import keyboard, mouse
 except ImportError:
     print(
         "pynput not found. Run: bash scripts/dictation/install.sh",
@@ -57,6 +57,7 @@ from vocab_prompt import (  # noqa: E402
     build_whisper_prompt,
     load_all_vocabulary,
 )
+from x11_paste import capture_focus, paste_if_focused  # noqa: E402
 
 MODIFIER_KEYS = {
     "alt": {keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr},
@@ -76,10 +77,11 @@ RECORDER_RETRY_DELAY_SEC = 0.05
 RECORDER_WATCH_POLL_SEC = 0.05
 SHUTDOWN_BUDGET_SEC = 13.0
 SHUTDOWN_RESOURCE_RESERVE_SEC = 1.0
-CLIPBOARD_READY_TIMEOUT_SEC = 0.5
+# Startup can be delayed by desktop/runner load; retain the old owner while
+# allowing the replacement to become readable. Normal handoff returns early.
+CLIPBOARD_READY_TIMEOUT_SEC = 2.0
 CLIPBOARD_TERM_TIMEOUT_SEC = 0.25
 CLIPBOARD_KILL_TIMEOUT_SEC = 0.25
-XDOTOOL_TIMEOUT_SEC = 0.25
 TRAY_STOP_TIMEOUT_SEC = 0.5
 MAX_RECORDER_FLUSH_MSEC = 500.0
 RECORDER_STDERR_LIMIT_BYTES = 16 * 1024
@@ -564,6 +566,11 @@ class Dictation:
         self._clipboard_lock = threading.Lock()
         self._clipboard_proc: subprocess.Popen | None = None
         self._clipboard_closed = threading.Event()
+        self._interaction_serial = 0
+        self._session_targets: dict[int, tuple | None] = {}
+        self._delivery_attempted: set[Path] = set()
+        self._delivery_lock = threading.Lock()
+        self._last_delivery_reason = ""
         self._max_timer: threading.Timer | None = None
         self._recorder = build_recorder_cmd(self.audio_source, cfg)
         self._stream_recorder = (
@@ -621,7 +628,10 @@ class Dictation:
     def _on_hotkey(self) -> None:
         if self.hotkey_mode == "hold":
             if not self._recording:
-                threading.Thread(target=self._start_recording, daemon=True).start()
+                target = self._capture_paste_target()
+                threading.Thread(
+                    target=self._start_recording, kwargs={"target": target}, daemon=True
+                ).start()
             return
         # toggle: start or stop on each Ctrl+Space press
         if self._recording:
@@ -633,10 +643,17 @@ class Dictation:
                 return
             threading.Thread(target=self._finish_recording, daemon=True).start()
         else:
-            threading.Thread(target=self._start_recording, daemon=True).start()
+            target = self._capture_paste_target()
+            threading.Thread(
+                target=self._start_recording, kwargs={"target": target}, daemon=True
+            ).start()
 
     def on_press(self, key) -> None:
         self._pressed.add(key)
+        if not (self._is_trigger(key) and self._mods_active()) and not any(
+            key in keys for keys in MODIFIER_KEYS.values()
+        ):
+            self._interaction_serial += 1
         if not self._is_trigger(key) or not self._mods_active():
             return
         # One toggle per Ctrl+Space press (ignore Space auto-repeat while held).
@@ -653,6 +670,15 @@ class Dictation:
             return
         if self._is_trigger(key) and self._recording:
             threading.Thread(target=self._finish_recording, daemon=True).start()
+
+    def on_click(self, _x, _y, _button, pressed: bool) -> None:
+        if pressed:
+            self._interaction_serial += 1
+
+    def _capture_paste_target(self) -> tuple | None:
+        serial = self._interaction_serial
+        focus = capture_focus()
+        return (focus, serial) if focus is not None else None
 
     def _notify(self, msg: str) -> None:
         dwell_ms = self._notify_ms
@@ -930,7 +956,9 @@ class Dictation:
                 time.sleep(RECORDER_RETRY_DELAY_SEC)
         return None
 
-    def _start_stream_recording(self) -> None:
+    def _start_stream_recording(self, *, target=...) -> None:
+        if target is Ellipsis:
+            target = self._capture_paste_target()
         started = False
         hold = False
         with self._lock:
@@ -976,6 +1004,7 @@ class Dictation:
                 return
             self._recording = True
             self._session_paths[self._session_id] = self._active_session
+            self._session_targets[self._session_id] = target
             self._record_proc = proc
             self._wav_path = None
             self._record_generation += 1
@@ -1343,6 +1372,11 @@ class Dictation:
 
     def _deliver_completed_session(self, session: Path, session_id: int) -> None:
         """Dispatch a live session once, after every preceding chunk is terminal."""
+        with self._delivery_lock:
+            if session in self._delivery_attempted:
+                return
+            self._delivery_attempted.add(session)
+            target = self._session_targets.pop(session_id, None)
         text = self._store.completed_text(session)
         transcript = session / "transcript.txt"
         if not text:
@@ -1354,13 +1388,23 @@ class Dictation:
             self._notify(f"No usable speech — session saved at {transcript}")
             return
 
-        if not self._insert(text):
+        if not self._insert(text, target=target):
             print(
                 f"whisper-dictation: paste-failed session={session.name} "
                 f"chars={len(text)} saved={transcript}",
                 file=sys.stderr,
             )
-            self._notify(f"Paste failed — transcript saved at {transcript}")
+            if self._last_delivery_reason in {
+                "focus-changed",
+                "unknown-focus",
+                "input-active",
+            }:
+                self._notify(
+                    f"Text copied; focus changed or keyboard busy. "
+                    f"Paste where you want with Ctrl+V. Saved at {transcript}"
+                )
+            else:
+                self._notify(f"Paste failed — transcript saved at {transcript}")
             return
 
         print(
@@ -1368,8 +1412,7 @@ class Dictation:
             f"session_id={session_id} chars={len(text)}",
             file=sys.stderr,
         )
-        preview = text if len(text) <= 60 else text[:57] + "…"
-        self._notify(f"Typed: {preview}")
+        self._notify(f"Pasted {len(text)} characters")
 
     def _deliver_completed_session_safely(self, session: Path, session_id: int) -> None:
         try:
@@ -1493,10 +1536,12 @@ class Dictation:
         reason = self._last_recorder_error or detail
         self._notify(f"Recorder unavailable — saved prior audio ({reason[:80]})")
 
-    def _start_recording(self) -> None:
+    def _start_recording(self, *, target=...) -> None:
         if self.continuous_capture:
-            self._start_stream_recording()
+            self._start_stream_recording(target=target)
             return
+        if target is Ellipsis:
+            target = self._capture_paste_target()
         started = False
         hold = False
         watch: tuple[subprocess.Popen, str, int] | None = None
@@ -1536,6 +1581,7 @@ class Dictation:
                 minimum_audio_rms=self.min_audio_rms,
             )
             self._session_paths[self._session_id] = self._active_session
+            self._session_targets[self._session_id] = target
             self._tray.set_recording(True)
             generation = self._activate_recorder_locked(spawned)
             watch = (*spawned, generation)
@@ -2116,9 +2162,9 @@ class Dictation:
             if self._clipboard_closed.is_set():
                 return False
             previous = self._clipboard_proc
-            self._clipboard_proc = None
-            if previous is not None:
-                self._terminate_clipboard_process(previous)
+            # Keep the old selection alive until xclip acquires its replacement.
+            # An ownership gap lets clipboard managers restore the old text,
+            # racing the new owner and sometimes replacing a verified transcript.
             try:
                 proc = subprocess.Popen(
                     ["xclip", "-quiet", "-selection", "clipboard"],
@@ -2126,7 +2172,11 @@ class Dictation:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-            except OSError:
+            except OSError as exc:
+                print(
+                    f"whisper-dictation: clipboard-failed stage=start error={exc}",
+                    file=sys.stderr,
+                )
                 return False
             try:
                 if proc.stdin is None:
@@ -2151,28 +2201,46 @@ class Dictation:
                         if self._clipboard_closed.is_set():
                             break
                         self._clipboard_proc = proc
+                        if previous is not None:
+                            self._terminate_clipboard_process(previous)
                         return True
                     time.sleep(0.01)
-            except (BrokenPipeError, OSError):
-                pass
+            except (BrokenPipeError, OSError) as exc:
+                print(
+                    f"whisper-dictation: clipboard-failed stage=write error={exc}",
+                    file=sys.stderr,
+                )
+            print(
+                f"whisper-dictation: clipboard-failed stage=verify exit={proc.poll()}",
+                file=sys.stderr,
+            )
             self._terminate_clipboard_process(proc)
             return False
 
-    def _run_xdotool_if_open(self, command: list[str]) -> bool:
+    def _paste_if_open(self, target: tuple | None) -> bool:
         with self._clipboard_lock:
             if self._clipboard_closed.is_set():
                 return False
-            try:
-                result = subprocess.run(
-                    command,
-                    check=False,
-                    timeout=XDOTOOL_TIMEOUT_SEC,
+            focus, serial = target if target is not None else (None, -1)
+            result = paste_if_focused(
+                focus,
+                lambda: (
+                    not self._clipboard_closed.is_set()
+                    and self._interaction_serial == serial
+                ),
+            )
+            self._last_delivery_reason = result
+            if result != "pasted":
+                print(
+                    f"whisper-dictation: paste-deferred reason={result}",
+                    file=sys.stderr,
                 )
-            except (OSError, subprocess.TimeoutExpired):
-                return False
-            return result.returncode == 0
+            return result == "pasted"
 
-    def _insert(self, text: str) -> bool:
+    def _insert(self, text: str, *, target=...) -> bool:
+        if target is Ellipsis:
+            target = self._capture_paste_target()
+        self._last_delivery_reason = "clipboard-failed"
         xclip_available = (
             subprocess.run(["which", "xclip"], capture_output=True).returncode == 0
         )
@@ -2181,9 +2249,7 @@ class Dictation:
             # arbitrary prefix in the target. Preserve the durable transcript
             # and report failure without sending any text events instead.
             return False
-        return self._run_xdotool_if_open(
-            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-        )
+        return self._paste_if_open(target)
 
     def _hotkey_label(self, cfg: dict[str, str]) -> str:
         mods = cfg.get("HOTKEY_MODIFIERS", "ctrl").replace(",", "+")
@@ -2235,9 +2301,12 @@ class Dictation:
             )
             print(msg, file=sys.stderr)
             self._notify(msg)
-        with keyboard.Listener(
-            on_press=self.on_press, on_release=self.on_release
-        ) as listener:
+        with (
+            mouse.Listener(on_click=self.on_click),
+            keyboard.Listener(
+                on_press=self.on_press, on_release=self.on_release
+            ) as listener,
+        ):
             listener.join()
 
 

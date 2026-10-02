@@ -43,6 +43,19 @@ partial slice finishes, all successful slices are assembled in order and sent in
 one clipboard paste. This prevents a changing application window from dropping
 middle slices between incremental pastes.
 
+Clipboard replacement keeps the previous owner alive until the new transcript
+is ready. This avoids an empty-clipboard interval in which desktop clipboard
+history can restore stale text and disrupt the paste.
+
+Dictation remembers the focused window when recording starts. Automatic paste
+waits for the hotkey to be released and only runs if focus is unchanged and no
+click or ordinary typing occurred in the meantime. This also guards cursor
+changes within a browser window. If you change location, the transcript stays
+saved and is copied to the clipboard: focus the intended field and press Ctrl+V.
+Whisper never switches windows for you or retries an uncertain paste. It sends
+the Ctrl+V press and release events together so a timed-out helper cannot leave
+Ctrl or V held down. Each completed session gets at most one automatic attempt.
+
 Each finalized slice is also retained under
 `~/.local/share/whisper-dictation/sessions/<session>/`. A failure in one slice
 does not stop later slices. The directory contains numbered WAV files,
@@ -64,7 +77,34 @@ A **silver dot** in the desktop top-panel tray shows dictation is running; it **
 | NVIDIA CUDA | `bash scripts/dictation/build-cuda.sh` | `WHISPER_BUILD_DIR="build-cuda"` |
 | Intel SYCL Level Zero | `bash scripts/dictation/build-sycl.sh` | `WHISPER_BUILD_DIR="build-sycl"` |
 
-Keep `WHISPER_ACCELERATOR="auto"`; it detects CUDA/SYCL from the build name or CMake cache. Hotkey, tray LED, and paste behavior are shared across backends. Use **X11** (not Wayland) for global Ctrl+Space and `xdotool` paste.
+Keep `WHISPER_ACCELERATOR="auto"`; it detects CUDA/SYCL from the build name or CMake cache. Hotkey, tray LED, and paste behavior are shared across backends. Use **X11** for global Ctrl+Space and focus-checked XTEST paste. Wayland, including a Wayland session with XWayland available, is not supported for global dictation.
+
+The clipboard and delivery fixes use the same Python/X11 implementation on
+**amd64/x86-64** (LG Gram) and **arm64/aarch64** (Spark/SPARCX). They do not select
+a GPU, model, microphone, username, home directory, or display number. Keep each
+machine's settings in `~/.config/whisper-dictation/config.env`; do not copy the
+workstation's configuration or systemd overrides onto the laptop.
+
+The installer declares `python-xlib` directly alongside `pynput`, `pystray`, and
+Pillow. `check.sh` checks the actual keyboard/mouse and XTEST dependencies without
+changing focus, writing the clipboard, or sending keys. To check just the desktop
+from a terminal in its graphical session:
+
+```bash
+scripts/dictation/.venv/bin/python scripts/dictation/desktop_check.py
+```
+
+The `Dictation reliability` workflow runs the same regression suite on Ubuntu
+24.04 x86-64 and ARM64 runners. Keyboard and clipboard tests use isolated Xvfb
+displays; they must never run against a user's active desktop. CPU/CUDA/SYCL
+configuration tests use controlled external-tool fixtures, without a GPU or model
+download. They do not substitute for testing actual GPU inference or the desktop
+applications used on each machine.
+
+For a machine acceptance check, run `check.sh`, then dictate a short message and
+a message longer than 45 seconds into an empty text field. Each should arrive
+once and in full. Changing fields during a third recording should leave the new
+field untouched and make the result available for manual paste.
 
 ### Tray LED — pin in Quick Settings (both machines)
 
@@ -324,10 +364,10 @@ systemctl --user restart whisper-dictation
 |---------|----------------|
 | No speech detected | `bash scripts/dictation/test-mic.sh` — set `AUDIO_SOURCE` in config |
 | Misheard words | Add the term to `scripts/dictation/vocabulary.txt` (see Terminology below), then restart |
-| Text pasted twice | Two daemons running — `rm ~/.config/autostart/whisper-dictation.desktop` then `systemctl --user restart whisper-dictation` |
+| Text pasted twice | Run `check.sh` for duplicate daemons; inspect the journal for delivery errors. The current paste path sends balanced key events and attempts each session once. Remove legacy desktop autostart only if it exists alongside the systemd service |
 | Server fallback | Check `systemctl --user status whisper-dictation-server` |
 | Recording LED works but no text | SYCL server hung — `/health` still returns ok. `systemctl --user restart whisper-dictation-server`. A watchdog now kills stuck inferences automatically. |
-| A long recording did not paste | Open the newest directory under `~/.local/share/whisper-dictation/sessions`; usable slices remain as numbered WAVs and `transcript.txt` marks any failed position. The journal logs either `paste-dispatched` or `paste-failed` with that session path |
+| A recording did not paste | If focus changed or the keyboard was busy, press Ctrl+V in the intended field. Otherwise open the newest directory under `~/.local/share/whisper-dictation/sessions`; usable slices remain as numbered WAVs and `transcript.txt` marks any failed position. The journal logs `paste-dispatched` or `paste-failed` with that session path; `clipboard-failed` and `paste-deferred` identify the delivery stage |
 | First GPU request is slow | Keep `WHISPER_SERVER_WARMUP=1`; wait for the server unit to become `active` before dictating |
 | CUDA backend missing | Run `nvidia-smi`, confirm `nvcc` is installed, rebuild with `build-cuda.sh`, then run `check.sh` |
 | SYCL device missing | Source oneAPI and run `ONEAPI_DEVICE_SELECTOR=level_zero:gpu sycl-ls` |

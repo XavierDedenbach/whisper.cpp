@@ -79,11 +79,16 @@ else
 fi
 [[ "${REC}" -eq 1 ]] || bad "no audio recorder (install pulseaudio-utils)"
 
-command -v xdotool >/dev/null && ok xdotool || bad "xdotool missing"
 command -v xclip >/dev/null && ok xclip || bad "xclip missing (atomic paste unavailable)"
 command -v curl >/dev/null && ok curl || echo "  WARN curl missing (needed for server backend)"
 
-[[ -x "${PY}" ]] && "${PY}" -c "from pynput import keyboard" 2>/dev/null && ok pynput || bad "pynput — run install.sh"
+if [[ ! -x "${PY}" ]]; then
+    bad "Python venv missing — run install.sh"
+elif DESKTOP_CHECK=$("${PY}" "${SCRIPT_DIR}/desktop_check.py" 2>&1); then
+    ok "${DESKTOP_CHECK}"
+else
+    bad "${DESKTOP_CHECK}"
+fi
 
 # Match the python daemon only (not this script's own argv, which mentions dictation.py).
 mapfile -t DICT_PIDS < <(pgrep -f "[p]ython.*/scripts/dictation/dictation\.py" || true)

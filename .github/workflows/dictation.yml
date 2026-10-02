@@ -1,0 +1,39 @@
+name: Dictation reliability
+
+on:
+  push:
+    paths:
+      - 'scripts/dictation/**'
+      - '.github/workflows/dictation.yml'
+  pull_request:
+    paths:
+      - 'scripts/dictation/**'
+      - '.github/workflows/dictation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install desktop test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 xvfb xauth xclip xdotool
+          python3 -m venv --system-site-packages "$RUNNER_TEMP/dictation-venv"
+          "$RUNNER_TEMP/dictation-venv/bin/pip" install -r scripts/dictation/requirements.txt pytest
+      - name: Test delivery, recovery, and CPU/CUDA/SYCL configuration
+        env:
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ''
+        run: |
+          xvfb-run -a "$RUNNER_TEMP/dictation-venv/bin/python" -m pytest -q scripts/dictation/test_*.py
+          bash -n scripts/dictation/*.sh
