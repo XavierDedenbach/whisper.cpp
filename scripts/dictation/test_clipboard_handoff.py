@@ -245,6 +245,29 @@ class ClipboardHandoffTests(unittest.TestCase):
         self.assertEqual(self.clipboard_text(), b"previous transcript")
         self.assertNotIn(0, self.owners())
 
+    def test_slow_replacement_keeps_previous_clipboard_until_ready(self) -> None:
+        self.assertTrue(self.app._start_clipboard_owner("previous transcript"))
+        previous = self.app._clipboard_proc
+        self.owners()
+        real_popen = subprocess.Popen
+
+        def delayed_owner(command, **kwargs):
+            if command[:2] == ["xclip", "-quiet"]:
+                command = [
+                    sys.executable,
+                    "-c",
+                    "import os, sys, time; time.sleep(0.75); "
+                    "os.execvp(sys.argv[1], sys.argv[1:])",
+                    *command,
+                ]
+            return real_popen(command, **kwargs)
+
+        with mock.patch("dictation.subprocess.Popen", side_effect=delayed_owner):
+            self.assertTrue(self.app._start_clipboard_owner("new transcript"))
+        self.assertEqual(self.clipboard_text(), b"new transcript")
+        self.assertIsNotNone(previous.poll())
+        self.assertNotIn(0, self.owners())
+
     @unittest.skipUnless(
         shutil.which("xdotool") and importlib.util.find_spec("gi"),
         "requires xdotool and GTK Python bindings",

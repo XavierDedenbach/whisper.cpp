@@ -77,7 +77,9 @@ RECORDER_RETRY_DELAY_SEC = 0.05
 RECORDER_WATCH_POLL_SEC = 0.05
 SHUTDOWN_BUDGET_SEC = 13.0
 SHUTDOWN_RESOURCE_RESERVE_SEC = 1.0
-CLIPBOARD_READY_TIMEOUT_SEC = 0.5
+# Startup can be delayed by desktop/runner load; retain the old owner while
+# allowing the replacement to become readable. Normal handoff returns early.
+CLIPBOARD_READY_TIMEOUT_SEC = 2.0
 CLIPBOARD_TERM_TIMEOUT_SEC = 0.25
 CLIPBOARD_KILL_TIMEOUT_SEC = 0.25
 TRAY_STOP_TIMEOUT_SEC = 0.5

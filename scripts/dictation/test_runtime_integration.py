@@ -808,13 +808,14 @@ class HangRecoveryTests(unittest.TestCase):
                 "dictation.subprocess.run", side_effect=[which, wrong]
             ) as run:
                 with mock.patch(
-                    "dictation.time.monotonic", side_effect=[100.0, 100.0, 100.6]
+                    "dictation.time.monotonic", side_effect=[100.0, 100.0, 103.0]
                 ):
                     with mock.patch("dictation.time.sleep"):
                         self.assertFalse(app._insert("expected"))
 
         owner.terminate.assert_called_once_with()
         self.assertIsNone(app._clipboard_proc)
+        self.paste.assert_not_called()
         self.assertFalse(
             any(call.args[0][0] == "xdotool" for call in run.call_args_list)
         )
