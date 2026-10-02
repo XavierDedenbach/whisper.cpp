@@ -9,10 +9,18 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from PIL import Image
+
+# The dictation venv contains pystray, but Debian/Ubuntu provide PyGObject in
+# the system site-packages directory. Make it visible before pystray selects a
+# backend so GNOME can use AppIndicator instead of the legacy X11 tray path.
+_SYSTEM_DIST_PACKAGES = Path("/usr/lib/python3/dist-packages")
+if _SYSTEM_DIST_PACKAGES.is_dir() and str(_SYSTEM_DIST_PACKAGES) not in sys.path:
+    sys.path.insert(0, str(_SYSTEM_DIST_PACKAGES))
 
 try:
     import pystray

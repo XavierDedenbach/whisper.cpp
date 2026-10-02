@@ -142,7 +142,7 @@ install_python() {
     echo "==> Python venv (pynput)"
     python3 -m venv "${SCRIPT_DIR}/.venv"
     "${SCRIPT_DIR}/.venv/bin/pip" install -q --upgrade pip
-    "${SCRIPT_DIR}/.venv/bin/pip" install -q pynput pystray pillow
+    "${SCRIPT_DIR}/.venv/bin/pip" install -q -r "${SCRIPT_DIR}/requirements.txt"
 }
 
 build_whisper() {

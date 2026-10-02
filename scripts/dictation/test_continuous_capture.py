@@ -90,8 +90,17 @@ class ContinuousCaptureTests(unittest.TestCase):
             retain.assert_called_once_with(proc, None)
 
     def _make_app(self, root: Path, recorder: Path) -> Dictation:
+        # These tests exercise real recorder processes and PCM persistence;
+        # transcription is not started. Keep prerequisite files in the fixture
+        # so they do not depend on a local SYCL build or downloaded model.
+        cli = root / "build-sycl/bin/whisper-cli"
+        cli.parent.mkdir(parents=True, exist_ok=True)
+        write_executable(cli, "#!/bin/sh\nexit 99\n")
+        model = root / "models/ggml-small.en.bin"
+        model.parent.mkdir(parents=True, exist_ok=True)
+        model.touch()
         cfg = {
-            "WHISPER_HOME": str(REPO_ROOT),
+            "WHISPER_HOME": str(root),
             "WHISPER_BUILD_DIR": "build-sycl",
             "WHISPER_MODEL": "small.en",
             "WHISPER_SESSION_DIR": str(root / "sessions"),
