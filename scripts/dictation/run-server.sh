@@ -66,9 +66,12 @@ if [[ "${ENGINE}" == "phonon2" ]]; then
             ;;
         cuda)
             BIN="$(command -v docker)"
+            PHONON_API_KEY="$("${PY}" "${PHONON_HELPER}" key "${PHONON_API_KEY_FILE}")"
+            export PHONON_API_KEY
             container_dir="$(mktemp -d -t whisper-phonon-container.XXXXXX)"
             args=(run --rm --init --gpus all --stop-timeout 5
                 --cidfile "${container_dir}/cid"
+                --env PHONON_API_KEY
                 -p "127.0.0.1:${PORT}:8000"
                 --mount "type=volume,source=whisper-dictation-phonon2-cache,target=/home/phonon/.cache"
                 "${PHONON_CUDA_IMAGE}" serve --model phonon-2 --host 0.0.0.0 --port 8000)
@@ -185,7 +188,7 @@ fi
 server_pid=$!
 
 deadline=$((SECONDS + WARMUP_TIMEOUT))
-while ! curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 "${SERVER_URL}/" >/dev/null 2>&1; do
+while ! curl --disable -fsS --noproxy '*' --connect-timeout 1 --max-time 2 "${SERVER_URL}/" >/dev/null 2>&1; do
     if ! kill -0 "${server_pid}" 2>/dev/null; then
         wait "${server_pid}" || true
         echo "whisper-dictation-server: server exited before becoming reachable" >&2
