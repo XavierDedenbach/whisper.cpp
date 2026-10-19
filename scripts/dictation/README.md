@@ -1,6 +1,8 @@
 # Desktop dictation (Ctrl+Space)
 
-Press **Ctrl+Space** to start recording, **Ctrl+Space** again to stop. [whisper.cpp](https://github.com/ggml-org/whisper.cpp) transcribes locally and pastes into the focused text field.
+Press **Ctrl+Space** to start recording, **Ctrl+Space** again to stop. The selected
+local engine ([whisper.cpp](https://github.com/ggml-org/whisper.cpp), the default,
+or Phonon-2) transcribes and pastes into the focused text field.
 
 Works on **Raspberry Pi 5**, Ubuntu, and other Debian-based desktops with **X11**.
 

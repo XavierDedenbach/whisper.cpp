@@ -348,7 +348,7 @@ def collect_provenance(cfg: dict[str, str]) -> dict[str, object]:
     cache = build_dir / "CMakeCache.txt"
     script_path = Path(__file__).resolve()
     repository_diff = _capture_command(["git", "diff", "--binary"], cwd=repo)
-    return {
+    provenance = {
         "exact_command": [str(script_path), *sys.argv[1:]],
         "repository_head": _capture_command(["git", "rev-parse", "HEAD"], cwd=repo),
         "repository_describe": _capture_command(
@@ -400,6 +400,27 @@ def collect_provenance(cfg: dict[str, str]) -> dict[str, object]:
             "python": sys.version,
         },
     }
+    if cfg.get("DICTATION_ENGINE", "whisper") == "phonon2":
+        health_body = _capture_command(
+            [
+                "curl",
+                "-fsS",
+                "--max-time",
+                "3",
+                cfg["WHISPER_SERVER_URL"].rstrip("/") + "/health",
+            ]
+        )
+        try:
+            health_payload = json.loads(health_body)
+        except ValueError:
+            health_payload = {"unavailable": health_body}
+        provenance["model"] = {"name": "Phonon-2", "runtime_health": health_payload}
+        provenance["server"] = {
+            "engine": "phonon2",
+            "device": cfg.get("PHONON_DEVICE", "cpu"),
+            "url": cfg["WHISPER_SERVER_URL"],
+        }
+    return provenance
 
 
 @contextmanager
@@ -527,7 +548,7 @@ def run_implemented_capture(
         cleanup.callback(_stop_probe_app, app)
         app._notify = notifications.append
 
-        def capture_insert(text: str) -> bool:
+        def capture_insert(text: str, *, target=...) -> bool:
             inserted.append(text)
             return True
 

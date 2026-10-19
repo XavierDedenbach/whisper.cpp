@@ -1,6 +1,6 @@
 # Implementation Plan: Configurable Phonon-2 dictation
 
-**Status:** Active (auto-approved)
+**Status:** Complete — implementation; delivery validation pending
 **Authority:** 2026-10-19 request to build Phonon-2 CPU on LG Gram, CUDA on Spark X,
 configure the repository, ship-it-good to the fork, and activate on this laptop.
 Spark owns its rollout; no remote Spark mutation. No chat archive requested.
@@ -95,8 +95,30 @@ start paths. Focused RED tests reproduced it; Phonon now bypasses only that asse
 check, preserving the shared recorder logic. A fresh 150-count production capture
 probe is running through an isolated Pulse sink and Xvfb, with no live paste.
 
-Next: finish full regression/production capture proof; record any model accuracy
-differences separately from byte ownership and ordered delivery. Then continue
-the already-authorized ship-it-good validation/review sequence, merge and local
-activation. No independent review has been launched yet. No Spark GPU execution
-or final LG cutover has been claimed.
+## Implementation proof / delivery handoff
+
+All 158 affected tests and 54 subtests passed under isolated Xvfb. Bash syntax,
+Ruff lint/format checks and Dockerfile `docker build --check` passed. Pytest now
+uses an isolated HOME so a test daemon cannot recover the operator's history.
+
+The fresh production-path 150-count run passed all ownership/delivery checks:
+one recorder, 4,952,960 captured and durable PCM bytes with matching SHA256,
+20 retained chunks (19 completed speech plus one silent tail), no failed chunks,
+closed session, and one final delivery identical to the ordered store. Raw proof:
+`/home/linu_x/.local/share/whisper-dictation/prototypes/phonon-production/dev-implemented-150-20261019T192820.695888Z/report.json`.
+Its model identity is Phonon-2 / CPU from actual health. The probe's callback was
+updated for the existing target-aware paste API; the earlier failed probe report
+is retained and not misrepresented as a passing delivery test.
+
+Strict recognition still first differs at 55, matching the already-accepted
+prototype behavior; this is not a claim of exact numeric recognition. This dense
+counting run had a 5.71 s median inference under current load. A bounded same-WAV,
+same-25-hotword one-thread versus 12-thread check produced identical text hashes
+and variable timing; 12 threads were not consistently worse. Keep the upstream
+default rather than tune against this fixture. No uniform sub-two-second latency
+claim is made. Temporary CPU test servers were stopped.
+
+Implementation is ready for validation. Continue the already-authorized
+ship-it-good consolidation/review sequence, merge and idle LG activation.
+Review rounds used: 0/3. Spark GPU execution and final LG activation remain
+separate, not-yet-claimed evidence. No production audio ownership code was forked.
