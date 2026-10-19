@@ -44,7 +44,8 @@ recovery, one daemon and one selected warm service. Preserve hardware-local conf
   canonical vocabulary, retry/restart and no Whisper fallback.
 - Runtime: `run-server.sh`, `runtime-env.sh`, `install.sh`, `check.sh`, config and
   pinned CPU/CUDA installer/build inputs. Controlled executable fixtures prove
-  both architectures, default compatibility, readiness and lifecycle semantics.
+  launcher commands, default compatibility, readiness and lifecycle semantics;
+  manifest checks establish NVIDIA base availability for both architectures.
 - Shared pipeline: unchanged `temporal_audio.py`, `session_store.py`, X11 paste
   and clipboard ownership. Existing Xvfb regression suite and real inference
   exercise integration; never send test keys to the live desktop.
@@ -92,8 +93,8 @@ The first full regression run found an old test object without constructor state
 the backward-compatible Whisper class default repairs that boundary. The first
 capture probe then exposed a real Whisper-asset prerequisite in both recorder
 start paths. Focused RED tests reproduced it; Phonon now bypasses only that asset
-check, preserving the shared recorder logic. A fresh 150-count production capture
-probe is running through an isolated Pulse sink and Xvfb, with no live paste.
+check, preserving the shared recorder logic. The fresh 150-count capture used an
+isolated Pulse sink and Xvfb, with no live paste; its completed result is below.
 
 ## Implementation proof / delivery handoff
 
@@ -118,7 +119,30 @@ and variable timing; 12 threads were not consistently worse. Keep the upstream
 default rather than tune against this fixture. No uniform sub-two-second latency
 claim is made. Temporary CPU test servers were stopped.
 
-Implementation is ready for validation. Continue the already-authorized
-ship-it-good consolidation/review sequence, merge and idle LG activation.
-Review rounds used: 0/3. Spark GPU execution and final LG activation remain
-separate, not-yet-claimed evidence. No production audio ownership code was forked.
+Consolidation removed the one-time prototype comparison scripts, preserving their
+reports, private data and Git history. The maintained capture probe and production
+vocabulary regressions remain. Round 1 found inherited-proxy exposure and an
+initial selected-device validation gap; both were reproduced RED and repaired.
+Phonon HTTP always bypasses proxies, and each chunk requires matching model/device
+health before inference with at most one managed restart. All 18 adapter tests
+and 11 subtests pass; real CPU warmup and three repeated daemon calls with 25
+hotwords also pass with a deliberately unusable proxy and empty NO_PROXY.
+
+Delivery validation continues; review rounds used: 2/3. Spark GPU execution and
+final LG activation remain separate, not-yet-claimed evidence. No production
+audio ownership code was forked.
+
+Final consolidated regression suite: **157 passed, 54 subtests passed** (Xvfb).
+The private clipboard fixture now uses `-noreset` after intermittent connection
+loss between test methods; the preceding failed runs remain in the local review
+ledger. All production capture and paste algorithms are unchanged. Ruff lint and
+format, shell syntax and whitespace checks pass. Final independent review and
+remote CI/merge are the remaining delivery gates before local activation.
+
+Round 2 tightened the readiness contract: Phonon always completes real warmup
+before READY, ignoring an inherited Whisper-only disable setting. Positive CPU
+and CUDA launcher fixtures and a negative failed-inference fixture reproduced the
+gap before repair. The production adapter/runtime suite passes: 19 tests and 11
+subtests; lint, formatting, shell syntax and whitespace checks also pass.
+unchanged ownership and desktop proof is reused. Architecture support claims now
+distinguish manifest availability from launcher fixtures and actual hardware.

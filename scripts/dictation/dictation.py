@@ -1965,11 +1965,22 @@ class Dictation:
         if self.engine == "phonon2":
             # A failed model response is not evidence of empty audio. Retain the
             # existing durable job as failed/recoverable; never change models.
+            restarted = False
+            if not self._server_health_ok():
+                restarted = True
+                if not self._restart_whisper_server() or not self._server_health_ok():
+                    raise RuntimeError(
+                        "Phonon model/device unavailable; retained audio requires retry"
+                    )
             for _ in range(2):
                 text = self._transcribe_server(wav_path)
                 if self._valid_server_text(text):
                     return text
-            if self._restart_whisper_server():
+            if (
+                not restarted
+                and self._restart_whisper_server()
+                and self._server_health_ok()
+            ):
                 text = self._transcribe_server(wav_path)
                 if self._valid_server_text(text):
                     return text

@@ -49,6 +49,8 @@ def health(url: str, device: str) -> bool:
             [
                 "curl",
                 "-fsS",
+                "--noproxy",
+                "*",
                 "--connect-timeout",
                 "1",
                 "--max-time",
@@ -74,6 +76,8 @@ def transcribe(url: str, wav: str, timeout: float, hotwords: list[str]) -> str |
         "curl",
         "--fail-with-body",
         "-sS",
+        "--noproxy",
+        "*",
         "--connect-timeout",
         "2",
         "--max-time",

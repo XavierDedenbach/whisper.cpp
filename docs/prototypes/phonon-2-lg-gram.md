@@ -70,7 +70,13 @@ The original development capture, including its silent final tail, was retained
 unchanged; this inference comparison used the 19 speech chunks only. The sealed
 500 fixture was neither read nor rerun.
 
-Reproduce with a new output directory and a temporary Phonon server:
+Historical reproduction commands below use the one-time comparison harness at
+Git commit `a7830500`. That harness was removed from the delivered runtime tree;
+recover it from Git history in an isolated checkout if this experiment needs to
+be reproduced. The maintained production capture probe is
+`scripts/dictation/numeric_continuity_probe.py`.
+
+Reproduce the historical experiment with a new output directory and a temporary Phonon server:
 
 ```bash
 cd /home/linu_x/Documents/git/whisper-phonon-2
@@ -149,3 +155,9 @@ and the correction verification at
 `/home/linu_x/.local/share/whisper-dictation/prototypes/phonon-2/hotwords-20261019-correction/report.json`.
 The separate runtime was stopped after testing. This is still an exploration
 branch; production Phonon integration has not been implemented or activated.
+
+### Closure — 2026-10-19
+
+The operator accepted Phonon-2 and authorized production integration. The prior
+measurements and their limitations remain historical evidence. Current runtime
+work and delivery gates are in [the production plan](../plans/phonon-production-backend.md).

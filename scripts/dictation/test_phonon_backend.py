@@ -14,11 +14,40 @@ from pathlib import Path
 from unittest import mock
 
 from dictation import Dictation
+from vocab_prompt import apply_replacements, build_phonon_hotwords, load_all_vocabulary
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class PhononBackendTests(unittest.TestCase):
+    def test_merged_dictionary_keeps_phrases_and_excludes_mishearings(self):
+        with tempfile.TemporaryDirectory() as raw:
+            repo, user = Path(raw) / "repo.txt", Path(raw) / "user.txt"
+            repo.write_text("Phonon-2 => fun on 2\npull request\nVantage\n")
+            user.write_text("Ada Lovelace\nvantage\n")
+            with (
+                mock.patch("vocab_prompt.repo_vocabulary_path", return_value=repo),
+                mock.patch("vocab_prompt.user_vocabulary_path", return_value=user),
+            ):
+                words = build_phonon_hotwords({"test": "1"})
+            self.assertEqual(
+                words, ["Phonon-2", "pull request", "Vantage", "Ada Lovelace"]
+            )
+
+    def test_observed_phonon_mishearings_are_boundary_safe(self):
+        terms, replacements = load_all_vocabulary()
+        self.assertIn("Phonon-2", terms)
+        self.assertNotIn("fun on 2", [term.lower() for term in terms])
+        self.assertEqual(
+            apply_replacements(
+                "Fun on 2, phono-2, phonon 2, fun on two, phonon two.", replacements
+            ),
+            "Phonon-2, Phonon-2, Phonon-2, Phonon-2, Phonon-2.",
+        )
+        self.assertEqual(
+            apply_replacements("Have fun on 20.", replacements), "Have fun on 20."
+        )
+
     def app(self, **changes):
         cfg = {
             "DICTATION_ENGINE": "phonon2",
@@ -29,7 +58,9 @@ class PhononBackendTests(unittest.TestCase):
         }
         cfg.update(changes)
         with mock.patch("dictation.threading.Thread.start"):
-            return Dictation(cfg)
+            app = Dictation(cfg)
+        app._server_health_ok = mock.Mock(return_value=True)
+        return app
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -100,6 +131,27 @@ class PhononBackendTests(unittest.TestCase):
                 app._transcribe("/tmp/audio.wav")
         cli.assert_not_called()
 
+    def test_wrong_device_health_does_not_accept_a_valid_transcript(self):
+        app = self.app(PHONON_DEVICE="cuda")
+        app._server_health_ok.return_value = False
+        app._transcribe_server = mock.Mock(return_value="valid text from wrong device")
+        with mock.patch.object(app, "_restart_whisper_server", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "Phonon"):
+                app._transcribe("/tmp/audio.wav")
+        app._transcribe_server.assert_not_called()
+
+    def test_wrong_device_health_can_recover_only_after_matching_restart(self):
+        app = self.app()
+        app._server_health_ok.side_effect = [False, True]
+        app._transcribe_server = mock.Mock(return_value="recovered on selected device")
+        with mock.patch.object(
+            app, "_restart_whisper_server", return_value=True
+        ) as restart:
+            self.assertEqual(
+                app._transcribe("/tmp/audio.wav"), "recovered on selected device"
+            )
+        restart.assert_called_once()
+
     def test_failed_middle_chunk_keeps_audio_and_does_not_block_later_chunk(self):
         app = self.app()
         app._notify = mock.Mock()
@@ -167,6 +219,15 @@ class PhononBackendTests(unittest.TestCase):
         received = []
 
         class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = json.dumps(
+                    {"status": "ok", "model": "phonon-2", "decode": {"engine": "cpu"}}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
             def do_POST(self):
                 received.append(
                     (self.path, self.rfile.read(int(self.headers["Content-Length"])))
@@ -186,12 +247,20 @@ class PhononBackendTests(unittest.TestCase):
         try:
             audio = Path(self.tmp.name) / "sample.wav"
             audio.write_bytes(b"RIFF fixture audio")
-            text = backend.transcribe(
-                f"http://127.0.0.1:{server.server_port}",
-                str(audio),
-                5,
-                ["Phonon-2", "pull request"],
-            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "http_proxy": "http://127.0.0.1:1",
+                    "ALL_PROXY": "http://127.0.0.1:1",
+                    "NO_PROXY": "",
+                    "no_proxy": "",
+                },
+            ):
+                url = f"http://127.0.0.1:{server.server_port}"
+                text = backend.transcribe(
+                    url, str(audio), 5, ["Phonon-2", "pull request"]
+                )
+                self.assertTrue(backend.health(url, "cpu"))
         finally:
             server.shutdown()
             server.server_close()
@@ -252,6 +321,7 @@ class PhononRuntimeTests(unittest.TestCase):
             'WHISPER_SERVER_URL="http://127.0.0.1:18188"\n'
             'WHISPER_INFERENCE_WATCHDOG_SEC="0"\nWHISPER_SERVER_RECYCLE_SEC="0"\n'
             'WHISPER_SERVER_WARMUP_TIMEOUT="5"\n'
+            'WHISPER_SERVER_WARMUP="0"\n'
         )
         bins = root / "bin"
         log = root / "events"
@@ -279,7 +349,13 @@ class PhononRuntimeTests(unittest.TestCase):
             payload["decode"] = {"engine": "cpu"}
         else:
             payload.update(gpu="NVIDIA GB10", path="CUDA-graph TDT")
-        self.executable(bins / "curl", "printf '%s' '" + json.dumps(payload) + "'\n")
+        self.executable(
+            bins / "curl",
+            'echo "curl $*" >> "$EVENT_LOG"\n'
+            + "printf '%s' '"
+            + json.dumps(payload)
+            + "'\n",
+        )
         return env, log
 
     def test_cpu_and_cuda_server_readiness_and_owned_shutdown(self):
@@ -322,6 +398,10 @@ class PhononRuntimeTests(unittest.TestCase):
                     stdout, stderr = proc.communicate(timeout=12)
                 self.assertEqual(proc.returncode, 0, stdout + stderr)
                 events = log.read_text()
+                self.assertIn("/v1/audio/transcriptions", events)
+                self.assertLess(
+                    events.index("/v1/audio/transcriptions"), events.index("--ready")
+                )
                 if device == "cpu":
                     self.assertIn(
                         "serve phonon-2 --host 127.0.0.1 --port 18188", events
@@ -330,6 +410,43 @@ class PhononRuntimeTests(unittest.TestCase):
                     self.assertIn("--gpus all", events)
                     self.assertIn("127.0.0.1:18188:8000", events)
                     self.assertIn("stop --time 5 fixture-owned-cid", events)
+
+    def test_disabled_warmup_cannot_publish_ready_after_failed_inference(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            env, log = self.fixture(root)
+            self.executable(
+                root / "runtime/bin/fermion",
+                "trap 'exit 0' TERM INT\nwhile true; do sleep 0.1; done\n",
+            )
+            self.executable(
+                root / "bin/curl",
+                'echo "curl $*" >> "$EVENT_LOG"\n'
+                '[[ "$*" != *"/v1/audio/transcriptions"* ]] || exit 22\n'
+                'printf \'%s\' \'{"status":"ok","model":"phonon-2","decode":{"engine":"cpu"}}\'\n',
+            )
+            proc = subprocess.Popen(
+                ["bash", str(SCRIPT_DIR / "run-server.sh")],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None or (
+                        log.exists() and "--ready" in log.read_text()
+                    ):
+                        break
+                    time.sleep(0.05)
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                stdout, stderr = proc.communicate(timeout=12)
+            self.assertNotEqual(proc.returncode, 0, stdout + stderr)
+            self.assertIn("/v1/audio/transcriptions", log.read_text())
+            self.assertNotIn("--ready", log.read_text())
 
     def test_cuda_installer_builds_native_image_and_requires_gpu(self):
         with tempfile.TemporaryDirectory() as name:

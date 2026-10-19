@@ -185,7 +185,7 @@ fi
 server_pid=$!
 
 deadline=$((SECONDS + WARMUP_TIMEOUT))
-while ! curl -fsS --connect-timeout 1 --max-time 2 "${SERVER_URL}/" >/dev/null 2>&1; do
+while ! curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 "${SERVER_URL}/" >/dev/null 2>&1; do
     if ! kill -0 "${server_pid}" 2>/dev/null; then
         wait "${server_pid}" || true
         echo "whisper-dictation-server: server exited before becoming reachable" >&2
@@ -199,15 +199,12 @@ while ! curl -fsS --connect-timeout 1 --max-time 2 "${SERVER_URL}/" >/dev/null 2
 done
 
 if [[ "${ENGINE}" == "phonon2" ]]; then
-    # Validate the selected model/device before systemd publishes readiness.
+    # A Phonon service is ready only after selected-device inference succeeds.
+    # WHISPER_SERVER_WARMUP remains a Whisper-only compatibility setting.
     "${PY}" "${PHONON_HELPER}" health "${SERVER_URL}" --device "${PHONON_DEVICE}"
-    case "${WARMUP,,}" in
-        1|true|yes|on)
-            "${PY}" "${PHONON_HELPER}" warmup "${SERVER_URL}" --device "${PHONON_DEVICE}" \
-                --audio "${WARMUP_AUDIO}" --timeout "${WARMUP_TIMEOUT}"
-            echo "whisper-dictation-server: Phonon-2 startup warmup complete"
-            ;;
-    esac
+    "${PY}" "${PHONON_HELPER}" warmup "${SERVER_URL}" --device "${PHONON_DEVICE}" \
+        --audio "${WARMUP_AUDIO}" --timeout "${WARMUP_TIMEOUT}"
+    echo "whisper-dictation-server: Phonon-2 startup warmup complete"
 else
 case "${WARMUP,,}" in
     1|true|yes|on)

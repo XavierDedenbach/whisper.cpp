@@ -125,3 +125,11 @@ temporary Phonon process was stopped, both live Whisper services remained active
 and the primary checkout was clean. Keep the isolated model/runtime cache and
 private comparison data for review. No production backend change, personal
 transcript publication, PR, merge, or cutover is authorized.
+
+### Closure — 2026-10-19
+
+The operator accepted Phonon-2 without requiring further listening qualification
+and authorized [production integration](../plans/phonon-production-backend.md).
+The provisional references remain unverified, not silently promoted to truth.
+The one-time draft/comparison harness is archived at Git commit `a7830500`;
+private audio, drafts and review sheets remain local and intact.

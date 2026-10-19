@@ -105,7 +105,9 @@ alignment, raw response, timing, and frozen selection:
 and [selection.json](/home/linu_x/.local/share/whisper-dictation/prototypes/phonon-2/librispeech-30-20261019/selection.json).
 Public corpus audio and the large raw report are kept out of Git.
 
-Reproduce with the temporary Phonon server on 8180 and Whisper on 8178:
+Historical reproduction requires the archived one-time harness at Git commit
+`a7830500` (removed from the delivered runtime tree). Use an isolated checkout,
+with the temporary Phonon server on 8180 and Whisper on 8178:
 
 ```bash
 cd /home/linu_x/Documents/git/whisper-phonon-2
@@ -132,3 +134,10 @@ Keep the benchmark on `codex/explore-phonon-2`; review pending. The temporary
 Phonon server is stopped after measurement. Live Whisper services, model,
 configuration, and primary checkout remain unchanged. This harness is prototype
 code, not a production backend integration.
+
+### Closure — 2026-10-19
+
+The operator accepted the model despite the documented measurement limitations
+and authorized [production integration](../plans/phonon-production-backend.md).
+This reference experiment is complete; the source and reports remain recoverable
+from history and the local evidence paths above.

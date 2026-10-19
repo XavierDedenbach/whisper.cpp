@@ -139,6 +139,8 @@ port 8178). `check.sh` requires the expected Phonon model, CPU/CUDA identity and
 successful sample inference. CUDA launch/cleanup fixtures are tested on the
 laptop; **Spark must perform its own native image build, GPU inference and
 desktop acceptance during rollout**. Laptop proof is not GPU qualification.
+Phonon startup always requires successful sample inference, even when an older
+config has `WHISPER_SERVER_WARMUP="0"`; that optional setting applies to Whisper.
 
 Canonical shared plus machine-local vocabulary is sent as JSON hotwords on every
 request. More than 25 active terms produces an actionable configuration error;

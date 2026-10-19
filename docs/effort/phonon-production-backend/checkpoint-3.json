@@ -1,0 +1,111 @@
+{
+  "checkpoint_id": "checkpoint-3",
+  "cumulative": {
+    "calendar_elapsed_hours": 0.62,
+    "calendar_elapsed_ms": 2214352,
+    "do_betters": 0,
+    "execution_profiles": [
+      {
+        "agent_count": 3,
+        "configuration_source": "reported",
+        "harness": "codex",
+        "model": "unknown",
+        "role": "reviewer",
+        "setting": "high"
+      },
+      {
+        "agent_count": 1,
+        "configuration_source": "unknown",
+        "harness": "codex",
+        "model": "unknown",
+        "role": "owner",
+        "setting": "unknown"
+      }
+    ],
+    "failed_approach_retries": 0,
+    "human_answers": 0,
+    "human_approvals": 0,
+    "human_interactions": 1,
+    "human_messages": 1,
+    "rebuilds": 0,
+    "recorded_agent_hours": 0.67,
+    "recorded_agent_ms": 2428573,
+    "recorded_owner_hours": 0.61,
+    "recorded_owner_ms": 2213732,
+    "recorded_subagent_hours": 0.06,
+    "recorded_subagent_ms": 214841,
+    "reworks": 0,
+    "tokens_consumed": null
+  },
+  "cutoff_ms": 1792439393031,
+  "feature": "phonon-production-backend",
+  "interval": {
+    "calendar_elapsed_hours": 0.24,
+    "calendar_elapsed_ms": 881215,
+    "do_betters": 0,
+    "execution_profiles": [
+      {
+        "agent_count": 3,
+        "configuration_source": "reported",
+        "harness": "codex",
+        "model": "unknown",
+        "role": "reviewer",
+        "setting": "high"
+      },
+      {
+        "agent_count": 1,
+        "configuration_source": "unknown",
+        "harness": "codex",
+        "model": "unknown",
+        "role": "owner",
+        "setting": "unknown"
+      }
+    ],
+    "failed_approach_retries": 0,
+    "human_answers": 0,
+    "human_approvals": 0,
+    "human_interactions": 0,
+    "human_messages": 0,
+    "rebuilds": 0,
+    "recorded_agent_hours": 0.3,
+    "recorded_agent_ms": 1095638,
+    "recorded_owner_hours": 0.24,
+    "recorded_owner_ms": 880797,
+    "recorded_subagent_hours": 0.06,
+    "recorded_subagent_ms": 214841,
+    "reworks": 0,
+    "tokens_consumed": null
+  },
+  "measurement": "prospective_checkpoint_ledger",
+  "previous_checkpoint_id": "phonon-production-checkpoint-2",
+  "prior_adjustments": {
+    "recorded_agent_ms": 682,
+    "recorded_owner_ms": 682
+  },
+  "quality": {
+    "accuracy_qualification": "not_claimed",
+    "calendar": "recorded_wall_clock_including_idle_and_waits",
+    "configuration": "per_profile_basis",
+    "counters": "agent_reported",
+    "gaps": [
+      "reporting_completeness_not_independently_verified",
+      "unclosed_work_run",
+      "token_usage_not_recorded",
+      "unknown_configuration"
+    ],
+    "timing": {
+      "completed_runs": 3,
+      "coverage": "recorded_boundaries_only",
+      "definition": "per_agent_work_intervals_including_tools_and_in_turn_waits",
+      "interrupted_runs": 0,
+      "open_runs": 1,
+      "started_ms": 1792437178881,
+      "started_runs": 4
+    },
+    "token_coverage": "recorded_usage_only",
+    "tokens": "reported_provider_input_including_cache_plus_output"
+  },
+  "schema_version": 3,
+  "timing_started_ms": 1792437178881,
+  "tracking_started_ms": 1792437178679
+}
