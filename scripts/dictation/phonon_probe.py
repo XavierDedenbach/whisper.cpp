@@ -19,6 +19,7 @@ from numeric_continuity_probe import score_transcript, self_test
 from temporal_audio import prepared_padded_wav
 from vocab_prompt import (
     apply_replacements,
+    build_phonon_hotwords,
     build_whisper_prompt,
     load_all_vocabulary,
     load_config,
@@ -30,12 +31,7 @@ def digest(path: Path) -> str:
 
 
 def phonon_hotwords(cfg: dict[str, str] | None = None) -> list[str]:
-    terms, _ = load_all_vocabulary(cfg)
-    if len(terms) > 25:
-        raise ValueError(
-            "Phonon-2 supports at most 25 active hotwords; select a smaller dictionary"
-        )
-    return terms
+    return build_phonon_hotwords(cfg)
 
 
 def request(

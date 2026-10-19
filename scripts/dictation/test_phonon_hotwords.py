@@ -28,7 +28,7 @@ class PhononHotwordTests(unittest.TestCase):
 
     def test_dictionary_over_the_server_limit_is_not_silently_truncated(self):
         with mock.patch(
-            "phonon_probe.load_all_vocabulary",
+            "vocab_prompt.load_all_vocabulary",
             return_value=([f"term{i}" for i in range(26)], []),
         ):
             with self.assertRaisesRegex(ValueError, "25"):

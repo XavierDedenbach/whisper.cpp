@@ -69,6 +69,91 @@ A **silver dot** in the desktop top-panel tray shows dictation is running; it **
 
 ## Machine profiles: Spark workstation vs LG Gram laptop
 
+### Phonon-2 (optional production engine)
+
+`DICTATION_ENGINE="whisper"` remains the repository default. Set
+`DICTATION_ENGINE="phonon2"` in `~/.config/whisper-dictation/config.env` to use
+Phonon-2. This automatically selects the existing warm-server service, even if an
+older machine config still says `WHISPER_BACKEND="cli"`. The recorder, durable
+chunks, ordering, focus guard, final paste, tray and recovery store stay shared.
+No alternate microphone or clipboard implementation is installed.
+
+For the **LG Gram**, keep the current working audio/desktop settings and add:
+
+```ini
+DICTATION_ENGINE="phonon2"
+PHONON_DEVICE="cpu"
+PHONON_THREADS="0"
+```
+
+Zero threads means the upstream runtime chooses its physical-core default. The
+pinned runtime (`fermion-research==0.2.11`, CPU `torch==2.14.1`) is installed under
+`~/.local/share/whisper-dictation/phonon-venv`, outside any feature worktree.
+Python 3.12 is required by the installer default; `PHONON_PYTHON` can select an
+already installed compatible Python. No system Python packages are replaced.
+
+```bash
+cd /home/linu_x/Documents/git/whisper.cpp
+bash scripts/dictation/install-phonon.sh cpu
+bash scripts/dictation/install.sh --autostart-only
+bash scripts/dictation/check.sh
+```
+
+For a fresh installation, configure the engine first and run the normal
+`install.sh`: it installs desktop dependencies and the selected Phonon runtime
+without building/downloading Whisper assets. Existing installs can use the
+runtime-only installer and refresh autostart as above. Do not restart while a
+recording is active. `--autostart-only` preserves existing local config and X11
+systemd drop-ins; it does restart the selected services.
+
+For **Spark X**, use the same dictionary and capture settings, with:
+
+```ini
+DICTATION_ENGINE="phonon2"
+PHONON_DEVICE="cuda"
+```
+
+Run the following from Spark's actual clone (replace the absolute example path):
+
+```bash
+cd /absolute/path/to/whisper.cpp
+bash scripts/dictation/install-phonon.sh cuda
+bash scripts/dictation/install.sh --autostart-only
+bash scripts/dictation/check.sh
+```
+
+CUDA requires Docker, its NVIDIA Container Toolkit integration, and a compatible
+host driver. The installer builds **natively for the host architecture** using
+`phonon-cuda.Dockerfile`, pinned upstream CUDA source and a digest-pinned NVIDIA
+PyTorch 25.09 / CUDA 13 multiarch base. This supports Spark's ARM64 build path;
+the publisher's `phonon-cuda:1.0.8` image itself is AMD64-only and must not be
+emulated as Spark's GPU runtime. The NVIDIA base can require a large download.
+The installer requires a real CUDA device before succeeding. Set
+`PHONON_CUDA_IMAGE` only to a compatible locally built image name.
+
+The selected systemd service owns its CPU child or GPU container, warms it before
+readiness, and exposes only `127.0.0.1` on the host at `WHISPER_SERVER_URL` (default
+port 8178). `check.sh` requires the expected Phonon model, CPU/CUDA identity and
+successful sample inference. CUDA launch/cleanup fixtures are tested on the
+laptop; **Spark must perform its own native image build, GPU inference and
+desktop acceptance during rollout**. Laptop proof is not GPU qualification.
+
+Canonical shared plus machine-local vocabulary is sent as JSON hotwords on every
+request. More than 25 active terms produces an actionable configuration error;
+terms are never silently discarded. The existing correction rules apply before
+durable transcript completion. Empty, malformed, HTTP-error or truncated model
+responses are retried, then retried after a managed restart. Exhaustion leaves
+the chunk failed/recoverable, not classified as empty microphone audio. There is
+no silent Whisper fallback in Phonon mode. Whisper's existing fallback behavior
+is unchanged when Whisper is selected.
+
+To roll back, set `DICTATION_ENGINE="whisper"`, leave the old model/build/device
+settings intact, and refresh autostart when idle. CPU, CUDA and Intel SYCL Whisper
+profiles remain available. Personal recordings and prototype comparison reports
+are not required to install or run either engine.
+
+### Whisper CPU / CUDA / SYCL (unchanged)
+
 `install.sh` always builds the portable **CPU + OpenBLAS** path in `build/`. Optional CUDA and SYCL builds live beside it, so pulling this fork never replaces another machine's selected backend. Existing machine-local config is preserved by `install.sh`.
 
 | Backend | Build | Select with |
