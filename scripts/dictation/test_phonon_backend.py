@@ -80,6 +80,9 @@ class PhononBackendTests(unittest.TestCase):
                     CONTINUOUS_CAPTURE=continuous, WHISPER_HOME=self.tmp.name
                 )
                 app._notify = mock.Mock()
+                # Spawning is mocked below; discovery must not depend on a
+                # physical recorder package being installed on the test host.
+                app._recorder = ["parecord"]
                 proc = mock.Mock(pid=12345)
                 proc.poll.return_value = None
                 with (
