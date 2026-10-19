@@ -478,6 +478,14 @@ class Dictation:
             raise ValueError("DICTATION_ENGINE must be whisper or phonon2")
         if self.engine == "phonon2" and self.phonon_device not in {"cpu", "cuda"}:
             raise ValueError("PHONON_DEVICE must be cpu or cuda")
+        self.phonon_api_key_file = (
+            cfg.get(
+                "PHONON_API_KEY_FILE",
+                str(Path.home() / ".config/whisper-dictation/phonon-api-key"),
+            )
+            if self.engine == "phonon2" and self.phonon_device == "cuda"
+            else None
+        )
         self.phonon_hotwords = (
             build_phonon_hotwords(cfg) if self.engine == "phonon2" else []
         )
@@ -1907,7 +1915,9 @@ class Dictation:
         if self.engine == "phonon2":
             from phonon_backend import health
 
-            return health(self.server_url, self.phonon_device)
+            return health(
+                self.server_url, self.phonon_device, key_file=self.phonon_api_key_file
+            )
         try:
             result = subprocess.run(
                 [
@@ -2111,7 +2121,11 @@ class Dictation:
             from phonon_backend import transcribe
 
             return transcribe(
-                self.server_url, wav_path, self.server_timeout, self.phonon_hotwords
+                self.server_url,
+                wav_path,
+                self.server_timeout,
+                self.phonon_hotwords,
+                key_file=self.phonon_api_key_file,
             )
         if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
             return None

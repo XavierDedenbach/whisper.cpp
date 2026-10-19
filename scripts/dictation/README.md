@@ -133,6 +133,14 @@ emulated as Spark's GPU runtime. The NVIDIA base can require a large download.
 The installer requires a real CUDA device before succeeding. Set
 `PHONON_CUDA_IMAGE` only to a compatible locally built image name.
 
+CUDA startup creates a private, reusable `0600` key at
+`~/.config/whisper-dictation/phonon-api-key` (`PHONON_API_KEY_FILE` can select a
+different private path). The container requires it even though host publication
+is loopback-only. The launcher passes it by environment name, and the HTTP client
+reads the same file through curl's stdin configuration, not secret command-line
+arguments. Missing, malformed or publicly readable keys fail closed; the CPU
+engine does not require or read this key. Do not commit or share it.
+
 The selected systemd service owns its CPU child or GPU container, warms it before
 readiness, and exposes only `127.0.0.1` on the host at `WHISPER_SERVER_URL` (default
 port 8178). `check.sh` requires the expected Phonon model, CPU/CUDA identity and

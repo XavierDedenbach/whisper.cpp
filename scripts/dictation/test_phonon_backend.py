@@ -362,8 +362,16 @@ class PhononRuntimeTests(unittest.TestCase):
         return env, log
 
     def test_cpu_and_cuda_server_readiness_and_owned_shutdown(self):
-        for device in ("cpu", "cuda"):
-            with self.subTest(device=device), tempfile.TemporaryDirectory() as name:
+        for device, key_style in (
+            ("cpu", "unused"),
+            ("cuda", "new"),
+            ("cuda", "padded"),
+            ("cuda", "tilde"),
+        ):
+            with (
+                self.subTest(device=device, key_style=key_style),
+                tempfile.TemporaryDirectory() as name,
+            ):
                 root = Path(name)
                 env, log = self.fixture(root, device)
                 child = (
@@ -373,11 +381,30 @@ class PhononRuntimeTests(unittest.TestCase):
                 if device == "cpu":
                     self.executable(root / "runtime/bin/fermion", child)
                 else:
+                    token = "test_token_" * 4
+                    if key_style in {"padded", "tilde"}:
+                        key_file = (
+                            root / "home/.config/whisper-dictation/phonon-api-key"
+                        )
+                        key_file.write_text("  " + token + "  \n")
+                        key_file.chmod(0o600)
+                        if key_style == "tilde":
+                            config = root / "home/.config/whisper-dictation/config.env"
+                            config.write_text(
+                                config.read_text()
+                                + 'PHONON_API_KEY_FILE="~/.config/whisper-dictation/phonon-api-key"\n'
+                            )
+                    key_check = (
+                        f'[[ "${{PHONON_API_KEY:-}}" == "{token}" ]] || exit 9\n'
+                        if key_style in {"padded", "tilde"}
+                        else ""
+                    )
                     self.executable(
                         root / "bin/docker",
                         'echo "$*" >> "$EVENT_LOG"\n'
                         'if [[ "$1" == stop ]]; then exit 0; fi\n'
-                        'while [[ "$1" != --cidfile ]]; do shift; done\n'
+                        + key_check
+                        + 'while [[ "$1" != --cidfile ]]; do shift; done\n'
                         'echo fixture-owned-cid > "$2"\n' + child,
                     )
                 proc = subprocess.Popen(
@@ -401,6 +428,9 @@ class PhononRuntimeTests(unittest.TestCase):
                     stdout, stderr = proc.communicate(timeout=12)
                 self.assertEqual(proc.returncode, 0, stdout + stderr)
                 events = log.read_text()
+                for event in events.splitlines():
+                    if event.startswith("curl "):
+                        self.assertTrue(event.startswith("curl --disable "), event)
                 self.assertIn("/v1/audio/transcriptions", events)
                 self.assertLess(
                     events.index("/v1/audio/transcriptions"), events.index("--ready")
@@ -411,6 +441,10 @@ class PhononRuntimeTests(unittest.TestCase):
                     )
                 else:
                     self.assertIn("--gpus all", events)
+                    self.assertIn("--env PHONON_API_KEY", events)
+                    key_file = root / "home/.config/whisper-dictation/phonon-api-key"
+                    self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
+                    self.assertNotIn(key_file.read_text().strip(), events)
                     self.assertIn("127.0.0.1:18188:8000", events)
                     self.assertIn("stop --time 5 fixture-owned-cid", events)
 
