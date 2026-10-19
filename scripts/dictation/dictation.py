@@ -54,6 +54,7 @@ from temporal_audio import (  # noqa: E402
 )
 from vocab_prompt import (  # noqa: E402
     apply_replacements,
+    build_phonon_hotwords,
     build_whisper_prompt,
     load_all_vocabulary,
 )
@@ -468,7 +469,18 @@ def parse_transcript_output(stdout: str) -> str:
 
 
 class Dictation:
+    engine = "whisper"
+
     def __init__(self, cfg: dict[str, str]) -> None:
+        self.engine = cfg.get("DICTATION_ENGINE", "whisper").strip().lower()
+        self.phonon_device = cfg.get("PHONON_DEVICE", "cpu").strip().lower()
+        if self.engine not in {"whisper", "phonon2"}:
+            raise ValueError("DICTATION_ENGINE must be whisper or phonon2")
+        if self.engine == "phonon2" and self.phonon_device not in {"cpu", "cuda"}:
+            raise ValueError("PHONON_DEVICE must be cpu or cuda")
+        self.phonon_hotwords = (
+            build_phonon_hotwords(cfg) if self.engine == "phonon2" else []
+        )
         self.home = resolve_whisper_home(cfg)
         self.build_dir = resolve_whisper_build_dir(cfg, self.home)
         model_name = cfg.get("WHISPER_MODEL", "small.en")
@@ -494,9 +506,15 @@ class Dictation:
         self.hotkey_mode = cfg.get("HOTKEY_MODE", "toggle").strip().lower()
         self.audio_source = cfg.get("AUDIO_SOURCE", "").strip()
         self.backend = cfg.get("WHISPER_BACKEND", "cli").strip().lower()
+        if self.engine == "phonon2":
+            self.backend = "server"
         self.server_url = cfg.get("WHISPER_SERVER_URL", "http://127.0.0.1:8178").rstrip(
             "/"
         )
+        if self.engine == "phonon2":
+            from phonon_backend import local_url
+
+            self.server_url = local_url(self.server_url)
         self.prompt = build_whisper_prompt(cfg)
         _, self.replacements = load_all_vocabulary(cfg)
         self.carry_initial_prompt = _truthy(
@@ -512,9 +530,13 @@ class Dictation:
         self.trailing_silence_seconds = float(
             cfg.get("TRANSCRIPTION_TRAILING_SILENCE_SEC", "0")
         )
-        raw_beam_size = cfg.get("WHISPER_BEAM_SIZE", "").strip()
+        raw_beam_size = (
+            cfg.get("WHISPER_BEAM_SIZE", "").strip() if self.engine == "whisper" else ""
+        )
         self.beam_size = int(raw_beam_size) if raw_beam_size else None
-        raw_audio_ctx = cfg.get("WHISPER_AUDIO_CTX", "").strip()
+        raw_audio_ctx = (
+            cfg.get("WHISPER_AUDIO_CTX", "").strip() if self.engine == "whisper" else ""
+        )
         self.audio_ctx = int(raw_audio_ctx) if raw_audio_ctx else None
         if self.beam_size is not None and self.beam_size <= 0:
             raise ValueError("WHISPER_BEAM_SIZE must be a positive integer")
@@ -969,12 +991,12 @@ class Dictation:
                 or self._rejected_recorder_pending()
             ):
                 return
-            if not self.cli.is_file():
+            if self.engine == "whisper" and not self.cli.is_file():
                 self._notify(
                     f"Missing {self.cli.name}; run scripts/dictation/install.sh"
                 )
                 return
-            if not self.model.is_file():
+            if self.engine == "whisper" and not self.model.is_file():
                 self._notify(f"Missing model {self.model.name}")
                 return
             spawned = self._spawn_stream_recorder()
@@ -1553,12 +1575,12 @@ class Dictation:
                 or self._rejected_recorder_pending()
             ):
                 return
-            if not self.cli.is_file():
+            if self.engine == "whisper" and not self.cli.is_file():
                 self._notify(
                     f"Missing {self.cli.name}; run scripts/dictation/install.sh"
                 )
                 return
-            if not self.model.is_file():
+            if self.engine == "whisper" and not self.model.is_file():
                 self._notify(f"Missing model {self.model.name}")
                 return
             if not self._recorder:
@@ -1882,6 +1904,10 @@ class Dictation:
         return None
 
     def _server_health_ok(self) -> bool:
+        if self.engine == "phonon2":
+            from phonon_backend import health
+
+            return health(self.server_url, self.phonon_device)
         try:
             result = subprocess.run(
                 [
@@ -1936,6 +1962,30 @@ class Dictation:
         beam_size: int | None = None,
         audio_ctx: int | None = None,
     ) -> str:
+        if self.engine == "phonon2":
+            # A failed model response is not evidence of empty audio. Retain the
+            # existing durable job as failed/recoverable; never change models.
+            restarted = False
+            if not self._server_health_ok():
+                restarted = True
+                if not self._restart_whisper_server() or not self._server_health_ok():
+                    raise RuntimeError(
+                        "Phonon model/device unavailable; retained audio requires retry"
+                    )
+            for _ in range(2):
+                text = self._transcribe_server(wav_path)
+                if self._valid_server_text(text):
+                    return text
+            if (
+                not restarted
+                and self._restart_whisper_server()
+                and self._server_health_ok()
+            ):
+                text = self._transcribe_server(wav_path)
+                if self._valid_server_text(text):
+                    return text
+            raise RuntimeError("Phonon inference failed; retained audio requires retry")
+
         def server_request(selected_beam: int | None) -> str | None:
             profile: dict[str, int] = {}
             if selected_beam is not None:
@@ -2057,6 +2107,12 @@ class Dictation:
         audio_ctx: int | None = None,
     ) -> str | None:
         """POST WAV to whisper-server. Return None to signal connection/HTTP failure."""
+        if self.engine == "phonon2":
+            from phonon_backend import transcribe
+
+            return transcribe(
+                self.server_url, wav_path, self.server_timeout, self.phonon_hotwords
+            )
         if subprocess.run(["which", "curl"], capture_output=True).returncode != 0:
             return None
         max_time = str(max(5, int(self.server_timeout)))
@@ -2275,7 +2331,11 @@ class Dictation:
 
     def run(self) -> None:
         self._start_tray_indicator()
-        ok = self.cli.is_file() and self.model.is_file()
+        ok = (
+            self._server_health_ok()
+            if self.engine == "phonon2"
+            else self.cli.is_file() and self.model.is_file()
+        )
         cfg = load_config()
         label = self._hotkey_label(cfg)
         if self.hotkey_mode == "toggle":
@@ -2285,19 +2345,31 @@ class Dictation:
         backend_line = f"  Backend: {self.backend}"
         if self.backend == "server":
             backend_line += f" ({self.server_url})"
+        model_line = (
+            f"  Model:   Phonon-2 on {self.phonon_device} ({'ok' if ok else 'NOT READY'})\n"
+            if self.engine == "phonon2"
+            else f"  Model:   {self.model.name} ({'ok' if self.model.is_file() else 'MISSING'})\n"
+        )
+        cli_line = (
+            ""
+            if self.engine == "phonon2"
+            else f"  CLI:     {self.cli.name} ({'ok' if self.cli.is_file() else 'MISSING'})\n"
+        )
         print(
             f"whisper-dictation ready\n"
             f"{usage}\n"
             f"  Home:    {self.home}\n"
-            f"  Model:   {self.model.name} ({'ok' if self.model.is_file() else 'MISSING'})\n"
+            f"{model_line}"
             f"{backend_line}\n"
-            f"  CLI:     {self.cli.name} ({'ok' if self.cli.is_file() else 'MISSING'})\n"
+            f"{cli_line}"
             f"  Mic:     {self.audio_source or '(system default)'}",
             flush=True,
         )
         if not ok:
             msg = (
-                "whisper-cli or model missing — run: bash scripts/dictation/install.sh"
+                "Phonon model/device not ready — check whisper-dictation-server.service"
+                if self.engine == "phonon2"
+                else "whisper-cli or model missing — run: bash scripts/dictation/install.sh"
             )
             print(msg, file=sys.stderr)
             self._notify(msg)

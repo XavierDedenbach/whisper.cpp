@@ -135,6 +135,16 @@ def default_vocabulary_path(cfg: dict[str, str]) -> Path:
     return user_vocabulary_path(cfg)
 
 
+def build_phonon_hotwords(cfg: dict[str, str] | None = None) -> list[str]:
+    """Canonical merged terms only; never silently truncate the model's vocabulary."""
+    terms, _ = load_all_vocabulary(cfg)
+    if len(terms) > 25:
+        raise ValueError(
+            "Phonon-2 supports at most 25 active hotwords; select a smaller dictionary"
+        )
+    return terms
+
+
 def apply_replacements(text: str, replacements: list[tuple[str, str]]) -> str:
     """Rewrite mishearings to canonical terms (longest match first)."""
     if not text or not replacements:

@@ -11,10 +11,19 @@ whisper_dictation_load_runtime() {
     local override_selector_set="${WHISPER_ONEAPI_DEVICE_SELECTOR+x}" override_selector="${WHISPER_ONEAPI_DEVICE_SELECTOR-}"
     local override_device_set="${WHISPER_SYCL_DEVICE+x}" override_device="${WHISPER_SYCL_DEVICE-}"
     local override_expected_set="${WHISPER_SYCL_EXPECTED_DEVICE+x}" override_expected="${WHISPER_SYCL_EXPECTED_DEVICE-}"
+    local override_engine_set="${DICTATION_ENGINE+x}" override_engine="${DICTATION_ENGINE-}"
+    local override_phonon_device_set="${PHONON_DEVICE+x}" override_phonon_device="${PHONON_DEVICE-}"
+    local override_url_set="${WHISPER_SERVER_URL+x}" override_url="${WHISPER_SERVER_URL-}"
 
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     install_env="${HOME}/.config/whisper-dictation/install.env"
     config="${HOME}/.config/whisper-dictation/config.env"
+
+    # Use the same repository defaults -> machine-local overlay order as Python.
+    set -a
+    # shellcheck disable=SC1091
+    source "${script_dir}/config.env"
+    set +a
 
     if [[ -f "${install_env}" ]]; then
         # shellcheck disable=SC1090
@@ -34,6 +43,9 @@ whisper_dictation_load_runtime() {
     [[ -n "${override_selector_set}" ]] && WHISPER_ONEAPI_DEVICE_SELECTOR="${override_selector}"
     [[ -n "${override_device_set}" ]] && WHISPER_SYCL_DEVICE="${override_device}"
     [[ -n "${override_expected_set}" ]] && WHISPER_SYCL_EXPECTED_DEVICE="${override_expected}"
+    [[ -n "${override_engine_set}" ]] && DICTATION_ENGINE="${override_engine}"
+    [[ -n "${override_phonon_device_set}" ]] && PHONON_DEVICE="${override_phonon_device}"
+    [[ -n "${override_url_set}" ]] && WHISPER_SERVER_URL="${override_url}"
 
     root="${WHISPER_REPO_ROOT:-}"
     if [[ -z "${root}" ]]; then
@@ -49,6 +61,16 @@ whisper_dictation_load_runtime() {
     export WHISPER_REPO_ROOT="${root}"
     export WHISPER_RESOLVED_BUILD_DIR
     export WHISPER_BIN_DIR="${WHISPER_RESOLVED_BUILD_DIR}/bin"
+
+    case "${DICTATION_ENGINE:-whisper}" in
+        phonon2)
+            case "${PHONON_DEVICE:-cpu}" in
+                cpu|cuda) return 0 ;;
+                *) echo "PHONON_DEVICE must be cpu or cuda" >&2; return 1 ;;
+            esac ;;
+        whisper) ;;
+        *) echo "DICTATION_ENGINE must be whisper or phonon2" >&2; return 1 ;;
+    esac
 
     accelerator="${WHISPER_ACCELERATOR:-auto}"
     if [[ "${accelerator,,}" == "auto" ]]; then

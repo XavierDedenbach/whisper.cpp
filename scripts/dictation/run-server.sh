@@ -25,15 +25,21 @@ INFERENCE_WATCHDOG_SEC="${WHISPER_INFERENCE_WATCHDOG_SEC:-90}"
 SERVER_RECYCLE_SEC="${WHISPER_SERVER_RECYCLE_SEC:-21600}"
 WATCHDOG_POLL_SEC="${WHISPER_WATCHDOG_POLL_SEC:-1}"
 PY="${ROOT}/scripts/dictation/.venv/bin/python"
+[[ -x "${PY}" ]] || PY="python3"
+ENGINE="${DICTATION_ENGINE:-whisper}"
+PHONON_HELPER="${SCRIPT_DIR}/phonon_backend.py"
 VOCAB_PY="${ROOT}/scripts/dictation/vocab_prompt.py"
 RESPONSE_VALIDATOR="${SCRIPT_DIR}/validate-server-response.py"
 
-if [[ -x "${PY}" && -f "${VOCAB_PY}" ]]; then
+if [[ -f "${VOCAB_PY}" ]]; then
     PROMPT="$("${PY}" "${VOCAB_PY}")"
 else
     PROMPT="${WHISPER_PROMPT:-}"
 fi
 
+if [[ "${ENGINE}" == "phonon2" ]]; then
+    SERVER_URL="$("${PY}" "${PHONON_HELPER}" url "${SERVER_URL}")"
+fi
 url="${SERVER_URL#http://}"
 url="${url#https://}"
 cfg_host="${url%%:*}"
@@ -44,9 +50,31 @@ if [[ "${cfg_host}" != "127.0.0.1" && "${cfg_host}" != "localhost" ]]; then
 fi
 SERVER_URL="http://${HOST}:${PORT}"
 
+container_dir=""
 BIN="${WHISPER_BIN_DIR}/whisper-server"
 MODEL_PATH="${ROOT}/models/ggml-${MODEL}.bin"
 
+if [[ "${ENGINE}" == "phonon2" ]]; then
+    case "${PHONON_DEVICE:-cpu}" in
+        cpu)
+            BIN="${PHONON_VENV:-${HOME}/.local/share/whisper-dictation/phonon-venv}/bin/fermion"
+            args=(serve phonon-2 --host "${HOST}" --port "${PORT}")
+            if [[ "${PHONON_THREADS:-0}" != "0" ]]; then
+                args+=(--threads "${PHONON_THREADS}")
+            fi
+            [[ -x "${BIN}" ]] || { echo "Missing Phonon runtime; run install-phonon.sh cpu" >&2; exit 1; }
+            ;;
+        cuda)
+            BIN="$(command -v docker)"
+            container_dir="$(mktemp -d -t whisper-phonon-container.XXXXXX)"
+            args=(run --rm --init --gpus all --stop-timeout 5
+                --cidfile "${container_dir}/cid"
+                -p "127.0.0.1:${PORT}:8000"
+                --mount "type=volume,source=whisper-dictation-phonon2-cache,target=/home/phonon/.cache"
+                "${PHONON_CUDA_IMAGE}" serve --model phonon-2 --host 0.0.0.0 --port 8000)
+            ;;
+    esac
+else
 if [[ ! -x "${BIN}" ]]; then
     echo "whisper-dictation-server: missing ${BIN}" >&2
     exit 1
@@ -73,6 +101,7 @@ fi
 case "${CARRY_INITIAL_PROMPT,,}" in
     1|true|yes|on) args+=(--carry-initial-prompt) ;;
 esac
+fi
 
 server_pid=""
 warmup_response=""
@@ -81,14 +110,24 @@ cleanup() {
     local status=$?
     trap - EXIT
     [[ -n "${warmup_response}" ]] && rm -f "${warmup_response}"
+    if [[ -n "${container_dir}" && -s "${container_dir}/cid" ]]; then
+        timeout 8 docker stop --time 5 "$(<"${container_dir}/cid")" >/dev/null 2>&1 || true
+    fi
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
         kill -TERM "${server_pid}" 2>/dev/null || true
         wait "${server_pid}" 2>/dev/null || true
+    fi
+    if [[ -n "${container_dir}" ]]; then
+        rm -f "${container_dir}/cid"
+        rmdir "${container_dir}" 2>/dev/null || true
     fi
     exit "${status}"
 }
 forward_stop() {
     stopping=1
+    if [[ -n "${container_dir}" && -s "${container_dir}/cid" ]]; then
+        timeout 8 docker stop --time 5 "$(<"${container_dir}/cid")" >/dev/null 2>&1 || true
+    fi
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
         kill -TERM "${server_pid}" 2>/dev/null || true
         wait "${server_pid}" 2>/dev/null || true
@@ -146,7 +185,7 @@ fi
 server_pid=$!
 
 deadline=$((SECONDS + WARMUP_TIMEOUT))
-while ! curl -fsS --connect-timeout 1 --max-time 2 "${SERVER_URL}/" >/dev/null 2>&1; do
+while ! curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 "${SERVER_URL}/" >/dev/null 2>&1; do
     if ! kill -0 "${server_pid}" 2>/dev/null; then
         wait "${server_pid}" || true
         echo "whisper-dictation-server: server exited before becoming reachable" >&2
@@ -159,6 +198,14 @@ while ! curl -fsS --connect-timeout 1 --max-time 2 "${SERVER_URL}/" >/dev/null 2
     sleep 0.1
 done
 
+if [[ "${ENGINE}" == "phonon2" ]]; then
+    # A Phonon service is ready only after selected-device inference succeeds.
+    # WHISPER_SERVER_WARMUP remains a Whisper-only compatibility setting.
+    "${PY}" "${PHONON_HELPER}" health "${SERVER_URL}" --device "${PHONON_DEVICE}"
+    "${PY}" "${PHONON_HELPER}" warmup "${SERVER_URL}" --device "${PHONON_DEVICE}" \
+        --audio "${WARMUP_AUDIO}" --timeout "${WARMUP_TIMEOUT}"
+    echo "whisper-dictation-server: Phonon-2 startup warmup complete"
+else
 case "${WARMUP,,}" in
     1|true|yes|on)
         if [[ ! -f "${WARMUP_AUDIO}" ]]; then
@@ -193,9 +240,14 @@ case "${WARMUP,,}" in
         echo "whisper-dictation-server: startup warmup complete"
         ;;
 esac
+fi
 
 if [[ -n "${NOTIFY_SOCKET:-}" ]] && command -v systemd-notify >/dev/null; then
-    systemd-notify --ready --status="Whisper model warm on ${WHISPER_ACCELERATOR:-cpu} (${WHISPER_RESOLVED_BUILD_DIR})"
+    status_text="Whisper model warm on ${WHISPER_ACCELERATOR:-cpu} (${WHISPER_RESOLVED_BUILD_DIR})"
+    if [[ "${ENGINE}" == "phonon2" ]]; then
+        status_text="Phonon-2 model warm on ${PHONON_DEVICE}"
+    fi
+    systemd-notify --ready --status="${status_text}"
 fi
 echo "whisper-dictation-server: ready at ${SERVER_URL}"
 

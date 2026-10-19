@@ -348,7 +348,7 @@ def collect_provenance(cfg: dict[str, str]) -> dict[str, object]:
     cache = build_dir / "CMakeCache.txt"
     script_path = Path(__file__).resolve()
     repository_diff = _capture_command(["git", "diff", "--binary"], cwd=repo)
-    return {
+    provenance = {
         "exact_command": [str(script_path), *sys.argv[1:]],
         "repository_head": _capture_command(["git", "rev-parse", "HEAD"], cwd=repo),
         "repository_describe": _capture_command(
@@ -400,6 +400,27 @@ def collect_provenance(cfg: dict[str, str]) -> dict[str, object]:
             "python": sys.version,
         },
     }
+    if cfg.get("DICTATION_ENGINE", "whisper") == "phonon2":
+        health_body = _capture_command(
+            [
+                "curl",
+                "-fsS",
+                "--max-time",
+                "3",
+                cfg["WHISPER_SERVER_URL"].rstrip("/") + "/health",
+            ]
+        )
+        try:
+            health_payload = json.loads(health_body)
+        except ValueError:
+            health_payload = {"unavailable": health_body}
+        provenance["model"] = {"name": "Phonon-2", "runtime_health": health_payload}
+        provenance["server"] = {
+            "engine": "phonon2",
+            "device": cfg.get("PHONON_DEVICE", "cpu"),
+            "url": cfg["WHISPER_SERVER_URL"],
+        }
+    return provenance
 
 
 @contextmanager
@@ -494,6 +515,10 @@ def run_implemented_capture(
     from dictation import Dictation, wav_rms
 
     cfg = load_config()
+    if args.engine:
+        cfg["DICTATION_ENGINE"] = args.engine
+    if args.server_url:
+        cfg["WHISPER_SERVER_URL"] = args.server_url
     cfg.update(
         {
             "WHISPER_SESSION_DIR": str(run_dir / "sessions"),
@@ -523,7 +548,7 @@ def run_implemented_capture(
         cleanup.callback(_stop_probe_app, app)
         app._notify = notifications.append
 
-        def capture_insert(text: str) -> bool:
+        def capture_insert(text: str, *, target=...) -> bool:
             inserted.append(text)
             return True
 
@@ -597,8 +622,8 @@ def run_implemented_capture(
     attestation_checks = {
         "one_recorder_process": app._stream_recorder_pids == [recorder_pid],
         "capture_mode_persisted": policy.get("capture_mode") == "continuous",
-        "beam_size_persisted": int(policy.get("beam_size", 0)) == (args.beam_size or 5),
-        "audio_ctx_persisted": int(policy.get("audio_ctx", 0)) == args.audio_ctx,
+        "beam_size_persisted": policy.get("beam_size") == app.beam_size,
+        "audio_ctx_persisted": policy.get("audio_ctx") == app.audio_ctx,
         "padding_persisted": float(policy.get("trailing_silence_seconds", -1))
         == args.trailing_silence_seconds,
         "silence_threshold_persisted": float(policy.get("minimum_audio_rms", -1))
@@ -661,14 +686,15 @@ def run_implemented_capture(
             "bad_statuses": bad_statuses,
         },
         "request": {
+            "engine": app.engine,
             "server_url": app.server_url,
             "target_seconds": args.target_seconds,
             "minimum_seconds": args.minimum_seconds,
             "maximum_seconds": args.maximum_seconds,
             "trailing_silence_seconds": args.trailing_silence_seconds,
             "minimum_audio_rms": args.minimum_audio_rms,
-            "beam_size": args.beam_size or 5,
-            "audio_ctx": args.audio_ctx,
+            "beam_size": app.beam_size,
+            "audio_ctx": app.audio_ctx,
             "text_overlap_or_deduplication": False,
         },
         "chunks": chunk_evidence,
@@ -777,6 +803,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-seconds", type=float, default=9.0)
     parser.add_argument("--trailing-silence-seconds", type=float, default=0.5)
     parser.add_argument("--audio-ctx", type=int, default=512)
+    parser.add_argument("--engine", choices=("whisper", "phonon2"))
+    parser.add_argument("--server-url", help="isolated local warm-server URL")
     parser.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACT_ROOT)
     parser.add_argument("--beam-size", type=int)
     parser.add_argument(

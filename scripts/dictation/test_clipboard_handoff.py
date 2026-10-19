@@ -35,7 +35,7 @@ class ClipboardHandoffTests(unittest.TestCase):
         read_fd, write_fd = os.pipe()
         try:
             cls.server = subprocess.Popen(
-                ["Xvfb", "-displayfd", str(write_fd), "-nolisten", "tcp"],
+                ["Xvfb", "-displayfd", str(write_fd), "-nolisten", "tcp", "-noreset"],
                 pass_fds=(write_fd,),
                 stdout=cls.log,
                 stderr=cls.log,

@@ -35,15 +35,24 @@ if [[ -f "${CFG}" ]]; then
     CONTINUOUS_CAPTURE="${CONTINUOUS_CAPTURE:-0}"
 fi
 MODEL="${ROOT}/models/ggml-${MODEL_NAME}.bin"
+ENGINE="${DICTATION_ENGINE:-whisper}"
+if [[ "${ENGINE}" == "phonon2" ]]; then
+    BACKEND="server"
+    ACCELERATOR=""
+fi
 
 echo "=== whisper-dictation check ==="
 echo ""
 
+if [[ "${ENGINE}" == "whisper" ]]; then
 [[ -x "${CLI}" ]] && ok "whisper-cli: ${CLI}" || bad "whisper-cli missing — run install.sh"
 [[ -x "${SERVER}" ]] && ok "whisper-server: ${SERVER}" || echo "  WARN whisper-server missing (needed for WHISPER_BACKEND=server)"
 [[ -f "${MODEL}" ]] && ok "model: ${MODEL}" || bad "model missing — ./models/download-ggml-model.sh ${MODEL_NAME}"
+else
+    ok "engine: Phonon-2 (${PHONON_DEVICE})"
+fi
 
-if [[ -f "${CFG}" ]] && grep -q '\$' "${CFG}" 2>/dev/null; then
+if [[ -f "${CFG}" ]] && grep -Eq '^WHISPER_HOME=.*(BASH_SOURCE|\$\()' "${CFG}" 2>/dev/null; then
     bad "config has bash syntax in WHISPER_HOME — remove or comment that line in ${CFG}"
 else
     ok "config: ${CFG} (model=${MODEL_NAME}, backend=${BACKEND}, build=${WHISPER_RESOLVED_BUILD_DIR})"
@@ -114,7 +123,7 @@ if systemctl --user is-active whisper-dictation-server.service &>/dev/null; then
 elif [[ "${BACKEND}" == "server" ]]; then
     bad "whisper-dictation-server inactive while backend=server"
 fi
-if [[ "${BACKEND}" == "server" && "${SERVER_SERVICE_ACTIVE}" -eq 1 ]]; then
+if [[ "${ENGINE}" == "whisper" && "${BACKEND}" == "server" && "${SERVER_SERVICE_ACTIVE}" -eq 1 ]]; then
     SERVER_MAIN_PID="$(systemctl --user show whisper-dictation-server.service --property MainPID --value 2>/dev/null || true)"
     RUNNING_SERVER_MATCH=0
     if [[ "${SERVER_MAIN_PID}" =~ ^[1-9][0-9]*$ ]]; then
@@ -144,7 +153,7 @@ fi
 
 echo ""
 echo "=== transcribe test (samples/jfk.wav) ==="
-if [[ -x "${CLI}" && -f "${MODEL}" ]]; then
+if [[ "${ENGINE}" == "whisper" && -x "${CLI}" && -f "${MODEL}" ]]; then
     CLI_LOG="$(mktemp --tmpdir whisper-dictation-check.XXXXXX.log)"
     trap 'rm -f "${CLI_LOG:-}"' EXIT
     # Keep diagnostic prints enabled so the selected backend/device can be proved.
@@ -175,7 +184,14 @@ if [[ -x "${CLI}" && -f "${MODEL}" ]]; then
         fi
     fi
 fi
-if [[ "${BACKEND}" == "server" ]]; then
+if [[ "${ENGINE}" == "phonon2" ]]; then
+    if "${PY}" "${SCRIPT_DIR}/phonon_backend.py" warmup "${SERVER_URL}" \
+        --device "${PHONON_DEVICE}" --audio "${ROOT}/samples/jfk.wav" --timeout 60; then
+        ok "Phonon model/device identity and real inference (${PHONON_DEVICE})"
+    else
+        bad "Phonon identity/device/inference check failed"
+    fi
+elif [[ "${BACKEND}" == "server" ]]; then
     if OUT=$(curl -sS --connect-timeout 2 --max-time 60 \
         "${SERVER_URL}/inference" \
         -F "file=@${ROOT}/samples/jfk.wav" \

@@ -185,6 +185,9 @@ install_autostart() {
 
     local display="${DISPLAY:-:0}"
     local backend="cli"
+    # Load the same default/overlay selection without initializing any GPU SDK.
+    # shellcheck disable=SC1090
+    source "${CONFIG_SRC}"
     if [[ -f "${CONFIG_DST}" ]]; then
         # shellcheck disable=SC1090
         set -a
@@ -192,6 +195,9 @@ install_autostart() {
         source "${CONFIG_DST}" 2>/dev/null || true
         set +a
         backend="${WHISPER_BACKEND:-cli}"
+    fi
+    if [[ "${DICTATION_ENGINE:-whisper}" == "phonon2" ]]; then
+        backend="server"
     fi
 
     mkdir -p "${HOME}/.config/systemd/user"
@@ -233,9 +239,16 @@ echo ""
 
 install_system_packages
 install_python
-build_whisper
-download_model
 install_config
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/runtime-env.sh"
+whisper_dictation_load_runtime
+if [[ "${DICTATION_ENGINE:-whisper}" == "phonon2" ]]; then
+    bash "${SCRIPT_DIR}/install-phonon.sh" "${PHONON_DEVICE:-cpu}"
+else
+    build_whisper
+    download_model
+fi
 write_install_env
 write_launcher
 
