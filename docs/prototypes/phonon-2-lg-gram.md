@@ -105,3 +105,47 @@ prototype code only. Its separate environment and downloaded model cache are
 retained for further experiments; no boot service was installed for Phonon.
 The temporary Phonon process is stopped after measurement. Both production
 Whisper services and their configuration remain unchanged. Review pending.
+
+### Round 2026-10-19 — dictionary hotwords and corrections
+
+The original speed comparison deliberately had no Phonon hotwords. The prototype
+now loads the same merged shared and laptop-local vocabulary as Whisper and sends
+the canonical terms in a JSON `hotwords` form field on every default Phonon
+request. Multiword terms stay whole, and right-hand mishearings never become
+hotwords. More than 25 active terms raises an actionable error rather than
+silently discarding entries. Explicit empty lists remain available to experiments.
+
+The shared list gained `Phonon-2`, with observed/spoken variants `fun on 2`,
+`fun on two`, `phono-2`, `phonon 2`, and `phonon two`. Output retains the original
+response text and separately applies the existing boundary-aware replacement
+rules as `corrected_text`. These replacements do not change recognition scores
+or rewrite the original comparison report.
+
+With human authorization, 1,269 retained transcript paths were examined locally
+for recurring terminology. The seven additions to this laptop's private overlay
+were IMU (57 mentions), HID (33), RP2040 (16), I2C (10), Grafana (16), MCP (8), and
+Morpheus (6). This gives 18 shared plus seven local terms: exactly 25. Frequencies
+are evidence of usefulness, not measured spelling-error rates: correct speech
+cannot be inferred reliably from transcripts alone. Raw personal transcripts and
+context excerpts were not added to Git or sent to an external service. No broad
+ITC-to-I2C replacement was added because that acronym can have other meanings.
+
+Five focused tests first failed before implementation and now pass: canonical
+shared/local merging, phrase preservation, exclusion of misspellings, explicit
+JSON transport/default dictionary use, the 25-term bound, raw/corrected output,
+and boundary-safe corrections. Ruff and diff whitespace checks pass.
+
+The real CPU server echoed the complete 25-term list in all three synthetic
+hotword requests. With the publisher's default strength, hotwords changed one
+HIV misrecognition to HID, but the raw Phonon-2 phrase stayed “fun on two.” The
+dictionary replacement correctly produced “I want to use Phonon-2 instead of
+whisper for dictation.” Grafana and RP2040 errors remained; this is wiring proof
+and a limited smoke test, not a claim of perfect vocabulary recognition.
+The three hotword requests took 0.197–0.267 seconds.
+
+Local evidence:
+`/home/linu_x/.local/share/whisper-dictation/prototypes/phonon-2/hotwords-20261019/report.json`
+and the correction verification at
+`/home/linu_x/.local/share/whisper-dictation/prototypes/phonon-2/hotwords-20261019-correction/report.json`.
+The separate runtime was stopped after testing. This is still an exploration
+branch; production Phonon integration has not been implemented or activated.

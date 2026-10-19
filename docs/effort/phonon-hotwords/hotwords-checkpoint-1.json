@@ -1,0 +1,91 @@
+{
+  "checkpoint_id": "hotwords-checkpoint-1",
+  "cumulative": {
+    "calendar_elapsed_hours": 0.05,
+    "calendar_elapsed_ms": 187111,
+    "do_betters": 0,
+    "execution_profiles": [
+      {
+        "agent_count": 1,
+        "configuration_source": "runtime",
+        "harness": "codex",
+        "model": "gpt-6",
+        "role": "owner",
+        "setting": "unknown"
+      }
+    ],
+    "failed_approach_retries": 0,
+    "human_answers": 0,
+    "human_approvals": 0,
+    "human_interactions": 3,
+    "human_messages": 3,
+    "rebuilds": 0,
+    "recorded_agent_hours": 0.05,
+    "recorded_agent_ms": 186886,
+    "recorded_owner_hours": 0.05,
+    "recorded_owner_ms": 186886,
+    "recorded_subagent_hours": 0.0,
+    "recorded_subagent_ms": 0,
+    "reworks": 0,
+    "tokens_consumed": null
+  },
+  "cutoff_ms": 1792432926841,
+  "feature": "phonon-hotwords",
+  "interval": {
+    "calendar_elapsed_hours": 0.05,
+    "calendar_elapsed_ms": 187111,
+    "do_betters": 0,
+    "execution_profiles": [
+      {
+        "agent_count": 1,
+        "configuration_source": "runtime",
+        "harness": "codex",
+        "model": "gpt-6",
+        "role": "owner",
+        "setting": "unknown"
+      }
+    ],
+    "failed_approach_retries": 0,
+    "human_answers": 0,
+    "human_approvals": 0,
+    "human_interactions": 3,
+    "human_messages": 3,
+    "rebuilds": 0,
+    "recorded_agent_hours": 0.05,
+    "recorded_agent_ms": 186886,
+    "recorded_owner_hours": 0.05,
+    "recorded_owner_ms": 186886,
+    "recorded_subagent_hours": 0.0,
+    "recorded_subagent_ms": 0,
+    "reworks": 0,
+    "tokens_consumed": null
+  },
+  "measurement": "prospective_checkpoint_ledger",
+  "previous_checkpoint_id": null,
+  "prior_adjustments": {},
+  "quality": {
+    "accuracy_qualification": "not_claimed",
+    "calendar": "recorded_wall_clock_including_idle_and_waits",
+    "configuration": "per_profile_basis",
+    "counters": "agent_reported",
+    "gaps": [
+      "reporting_completeness_not_independently_verified",
+      "token_usage_not_recorded",
+      "unknown_configuration"
+    ],
+    "timing": {
+      "completed_runs": 1,
+      "coverage": "recorded_boundaries_only",
+      "definition": "per_agent_work_intervals_including_tools_and_in_turn_waits",
+      "interrupted_runs": 0,
+      "open_runs": 0,
+      "started_ms": 1792432739820,
+      "started_runs": 1
+    },
+    "token_coverage": "recorded_usage_only",
+    "tokens": "reported_provider_input_including_cache_plus_output"
+  },
+  "schema_version": 3,
+  "timing_started_ms": 1792432739820,
+  "tracking_started_ms": 1792432739730
+}

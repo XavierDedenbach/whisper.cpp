@@ -17,14 +17,35 @@ from pathlib import Path
 
 from numeric_continuity_probe import score_transcript, self_test
 from temporal_audio import prepared_padded_wav
-from vocab_prompt import build_whisper_prompt, load_config
+from vocab_prompt import (
+    apply_replacements,
+    build_whisper_prompt,
+    load_all_vocabulary,
+    load_config,
+)
 
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def request(engine: str, audio: Path, prompt: str) -> dict:
+def phonon_hotwords(cfg: dict[str, str] | None = None) -> list[str]:
+    terms, _ = load_all_vocabulary(cfg)
+    if len(terms) > 25:
+        raise ValueError(
+            "Phonon-2 supports at most 25 active hotwords; select a smaller dictionary"
+        )
+    return terms
+
+
+def request(
+    engine: str,
+    audio: Path,
+    prompt: str,
+    *,
+    hotwords: list[str] | None = None,
+    replacements: list[tuple[str, str]] | None = None,
+) -> dict:
     port, route = (
         (8180, "/v1/audio/transcriptions")
         if engine == "phonon"
@@ -42,10 +63,15 @@ def request(engine: str, audio: Path, prompt: str) -> dict:
         "-F",
         f"file=@{audio}",
         "-F",
-        "response_format=json",
+        "response_format=verbose_json"
+        if engine == "phonon"
+        else "response_format=json",
     ]
     if engine == "phonon":
-        command += ["-F", "model=phonon-2"]
+        words = phonon_hotwords() if hotwords is None else hotwords
+        if len(words) > 25:
+            raise ValueError("Phonon-2 supports at most 25 active hotwords")
+        command += ["-F", "model=phonon-2", "-F", f"hotwords={json.dumps(words)}"]
     else:
         for field in (
             "temperature=0.0",
@@ -67,7 +93,15 @@ def request(engine: str, audio: Path, prompt: str) -> dict:
     payload = json.loads(result.stdout)
     if not isinstance(payload.get("text"), str):
         raise RuntimeError(f"invalid {engine} response: {payload}")
-    return {"seconds": seconds, "text": payload["text"].strip(), "response": payload}
+    if replacements is None:
+        _, replacements = load_all_vocabulary()
+    raw_text = payload["text"].strip()
+    return {
+        "seconds": seconds,
+        "text": raw_text,
+        "corrected_text": apply_replacements(raw_text, replacements),
+        "response": payload,
+    }
 
 
 def main() -> None:
@@ -94,7 +128,8 @@ def main() -> None:
         "session": str(args.session),
         "padding_seconds": 0.5,
         "self_test": "exact/mixed pass; missing/duplicate/substitution/reordered/unrelated fail",
-        "phonon_policy": "official default CPU threads, greedy, no hotwords",
+        "phonon_policy": "official default CPU threads, greedy, merged dictionary hotwords",
+        "phonon_hotwords": phonon_hotwords(),
         "whisper_policy": "small.en SYCL, beam5, context512, configured prompt",
         "cold_or_warmup": {},
         "chunks": [],
