@@ -153,9 +153,12 @@ config has `WHISPER_SERVER_WARMUP="0"`; that optional setting applies to Whisper
 Canonical shared plus machine-local vocabulary is sent as JSON hotwords on every
 request. More than 25 active terms produces an actionable configuration error;
 terms are never silently discarded. The existing correction rules apply before
-durable transcript completion. Empty, malformed, HTTP-error or truncated model
+durable transcript completion. A valid empty transcript is retried once, then
+recorded as `no_text` if the selected model/device is healthy; its WAV remains
+saved, and the next chunk proceeds without a model restart. Empty recognition
+does not mean an empty microphone file. Malformed, HTTP-error or truncated model
 responses are retried, then retried after a managed restart. Exhaustion leaves
-the chunk failed/recoverable, not classified as empty microphone audio. There is
+the chunk failed/recoverable. There is
 no silent Whisper fallback in Phonon mode. Whisper's existing fallback behavior
 is unchanged when Whisper is selected.
 

@@ -134,6 +134,76 @@ class PhononBackendTests(unittest.TestCase):
                 app._transcribe("/tmp/audio.wav")
         cli.assert_not_called()
 
+    def test_valid_empty_response_does_not_restart_healthy_phonon(self):
+        app = self.app()
+        app._transcribe_server = mock.Mock(return_value="")
+        with mock.patch.object(app, "_restart_whisper_server") as restart:
+            self.assertEqual(app._transcribe("/tmp/audio.wav"), "")
+        restart.assert_not_called()
+        self.assertEqual(app._transcribe_server.call_count, 2)
+
+    def test_empty_response_gets_one_retry_for_speech(self):
+        app = self.app()
+        app._transcribe_server = mock.Mock(side_effect=["", "actual speech"])
+        with mock.patch.object(app, "_restart_whisper_server") as restart:
+            self.assertEqual(app._transcribe("/tmp/audio.wav"), "actual speech")
+        restart.assert_not_called()
+
+    def test_empty_then_transport_error_remains_recoverable(self):
+        app = self.app()
+        app._transcribe_server = mock.Mock(side_effect=["", None, None])
+        with mock.patch.object(
+            app, "_restart_whisper_server", return_value=True
+        ) as restart:
+            with self.assertRaisesRegex(RuntimeError, "Phonon inference failed"):
+                app._transcribe("/tmp/audio.wav")
+        restart.assert_called_once()
+
+    def test_empty_response_after_server_recovery_is_no_text(self):
+        app = self.app()
+        app._transcribe_server = mock.Mock(side_effect=[None, None, ""])
+        with mock.patch.object(
+            app, "_restart_whisper_server", return_value=True
+        ) as restart:
+            self.assertEqual(app._transcribe("/tmp/audio.wav"), "")
+        restart.assert_called_once()
+
+    def test_empty_response_with_unhealthy_model_is_not_success(self):
+        app = self.app()
+        app._server_health_ok.side_effect = [True, False]
+        app._transcribe_server = mock.Mock(return_value="")
+        with mock.patch.object(app, "_restart_whisper_server", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "Phonon inference failed"):
+                app._transcribe("/tmp/audio.wav")
+
+    def test_empty_chunk_keeps_audio_and_allows_next_speech_chunk(self):
+        app = self.app()
+        app._notify = mock.Mock()
+        app.replacements = []
+        session = app._store.start_session(capture_mode="continuous")
+        app._transcribe_server = mock.Mock(side_effect=["", "", "next speech"])
+        with mock.patch.object(app, "_restart_whisper_server") as restart:
+            for index in range(2):
+                source = Path(self.tmp.name) / f"empty-replay-{index}.wav"
+                with wave.open(str(source), "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(16000)
+                    wav.writeframes(b"\x00\x10" * 16000)
+                job = app._store.ingest(session, index, source, 1, paste=False)
+                app._deliver_chunk(job)
+        app._store.stop_session(session)
+        restart.assert_not_called()
+        manifest = json.loads((session / "manifest.json").read_text())
+        self.assertEqual(
+            [chunk["status"] for chunk in manifest["chunks"]],
+            ["no_text", "complete"],
+        )
+        self.assertEqual([chunk["attempts"] for chunk in manifest["chunks"]], [0, 0])
+        self.assertEqual(app._store.completed_text(session), "next speech")
+        for index in range(2):
+            self.assertTrue((session / f"chunk-{index:04d}.wav").is_file())
+
     def test_wrong_device_health_does_not_accept_a_valid_transcript(self):
         app = self.app(PHONON_DEVICE="cuda")
         app._server_health_ok.return_value = False

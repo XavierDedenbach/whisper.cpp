@@ -1986,13 +1986,20 @@ class Dictation:
                 text = self._transcribe_server(wav_path)
                 if self._valid_server_text(text):
                     return text
+            # The adapter returns "" for valid empty recognition and None for
+            # inference/transport errors. After one retry, let the existing
+            # no_text path retain this WAV without restarting a healthy model.
+            if text == "" and self._server_health_ok():
+                return ""
             if (
                 not restarted
                 and self._restart_whisper_server()
                 and self._server_health_ok()
             ):
                 text = self._transcribe_server(wav_path)
-                if self._valid_server_text(text):
+                if self._valid_server_text(text) or (
+                    text == "" and self._server_health_ok()
+                ):
                     return text
             raise RuntimeError("Phonon inference failed; retained audio requires retry")
 
